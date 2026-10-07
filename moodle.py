@@ -86,9 +86,11 @@ class MoodleEvent:
 class FetchResult:
     """取得結果。0件のとき原因を説明できるよう、各段階の件数も持つ。"""
 
-    events: list  # フィルター一致 かつ これからの予定（日時順）
+    events: list  # 通知対象の予定（日時順）
     total: int  # カレンダー内の予定の総数
     upcoming: int  # そのうち、これから（または継続中）の予定の数
+    excluded: int = 0  # フィルターには一致したが、除外ワードで外れた件数
+    beyond_period: int = 0  # 「期間」設定の範囲外で外れた件数
 
 
 def _to_jst(dt) -> tuple:
@@ -130,8 +132,19 @@ def _is_upcoming(
     return (max(start, end) if end is not None else start) >= now
 
 
-def fetch_events(ics_url: str, filter_words: list, now=None) -> FetchResult:
-    """Moodleから予定を取得し、フィルターに一致する「これから」の予定を返す。
+def fetch_events(
+    ics_url: str,
+    filter_words: list,
+    now=None,
+    exclude_words=None,
+    max_days: Optional[int] = None,
+) -> FetchResult:
+    """Moodleから予定を取得し、条件に合う「これから」の予定を返す。
+
+    - filter_words : どれかを含む予定だけを対象にする（空なら全予定が対象）
+    - exclude_words: どれかを含む予定は対象から外す（フィルターより優先）
+    - max_days     : 今後この日数以内に始まる予定だけを対象にする（Noneなら制限なし）
+    大文字小文字・全角半角は区別しない。
 
     失敗時は MoodleError を投げる（エラー文を予定として返さない）。
     ネットワーク通信を行う同期関数なので、botからは asyncio.to_thread で呼ぶこと。
@@ -154,6 +167,14 @@ def fetch_events(ics_url: str, filter_words: list, now=None) -> FetchResult:
             "カレンダーURLが正しいか確認してください。"
         )
 
+    # メンテナンス画面やログイン画面が HTTP 200 のHTMLで返ってくることがある。
+    # それを「予定0件」と誤認しないよう、ICSかどうかを先に確認する。
+    if b"BEGIN:VCALENDAR" not in response.content[:4096].upper():
+        log.warning("Moodleの応答がICS形式ではありません（メンテナンス中の可能性）")
+        raise MoodleError(
+            "Moodleから予定データを受け取れませんでした（メンテナンス中の可能性があります）。"
+        )
+
     try:
         cal = Calendar.from_ical(response.content)
     except Exception as e:
@@ -161,9 +182,14 @@ def fetch_events(ics_url: str, filter_words: list, now=None) -> FetchResult:
         raise MoodleError("カレンダーデータの解析に失敗しました。") from None
 
     norm_words = [w for w in (normalize_text(w) for w in filter_words) if w]
+    norm_excludes = [w for w in (normalize_text(w) for w in (exclude_words or [])) if w]
+    horizon = now + datetime.timedelta(days=max_days) if max_days else None
+
     events = []
     total = 0
     upcoming = 0
+    excluded = 0
+    beyond_period = 0
     for component in cal.walk("VEVENT"):
         dtstart = component.get("dtstart")
         if dtstart is None:
@@ -176,9 +202,20 @@ def fetch_events(ics_url: str, filter_words: list, now=None) -> FetchResult:
             continue
         upcoming += 1
 
+        # 期間設定の範囲外（開始がhorizonより先）の予定は対象外
+        if horizon is not None and start > horizon:
+            beyond_period += 1
+            continue
+
         summary = str(component.get("summary", ""))
-        # フィルターが空なら全予定を対象にする。大文字小文字・全角半角は区別しない。
-        if norm_words and not any(w in normalize_text(summary) for w in norm_words):
+        norm_summary = normalize_text(summary)
+
+        # フィルターが空なら全予定を対象にする
+        if norm_words and not any(w in norm_summary for w in norm_words):
+            continue
+        # 除外ワードを含む予定は、フィルターに一致していても対象外（除外が優先）
+        if any(w in norm_summary for w in norm_excludes):
+            excluded += 1
             continue
 
         uid = str(component.get("uid", "")) or summary
@@ -188,7 +225,13 @@ def fetch_events(ics_url: str, filter_words: list, now=None) -> FetchResult:
 
     events.sort(key=lambda e: e.start)
     log.info(
-        "ICS解析: 全%d件 / これから%d件 / フィルター一致%d件",
-        total, upcoming, len(events),
+        "ICS解析: 全%d件 / これから%d件 / 期間外%d件 / 除外%d件 / 対象%d件",
+        total, upcoming, beyond_period, excluded, len(events),
     )
-    return FetchResult(events=events, total=total, upcoming=upcoming)
+    return FetchResult(
+        events=events,
+        total=total,
+        upcoming=upcoming,
+        excluded=excluded,
+        beyond_period=beyond_period,
+    )
