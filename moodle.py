@@ -1,6 +1,7 @@
 # Moodleサーバとの通信、.icsファイルの解析
 import datetime
 import logging
+import unicodedata
 from dataclasses import dataclass
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -13,6 +14,12 @@ from config import REQUEST_TIMEOUT
 log = logging.getLogger(__name__)
 
 JST = ZoneInfo("Asia/Tokyo")
+
+
+def normalize_text(text: str) -> str:
+    """フィルター判定用の正規化。大文字小文字と、全角/半角の違いを無視できるようにする。
+    （例: "Report" / "report" / "ＲＥＰＯＲＴ" はすべて同じ扱い）"""
+    return unicodedata.normalize("NFKC", text).casefold()
 
 
 class MoodleError(Exception):
@@ -35,6 +42,27 @@ class MoodleEvent:
     def key(self) -> tuple:
         """通知済み管理用のキー。日時が変わった予定は別物として扱われる。"""
         return (self.uid, self.start.strftime("%Y-%m-%dT%H:%M"))
+
+    def due_at(self, now: datetime.datetime) -> Optional[datetime.datetime]:
+        """「次に迫っている期限」の時刻。これから始まる予定は開始時刻、
+        すでに始まっている継続中の予定は終了時刻。終日予定や終了済みはNone。"""
+        if self.all_day:
+            return None
+        if self.start >= now:
+            return self.start
+        if self.end is not None and self.end >= now:
+            return self.end
+        return None
+
+    def is_due_soon(self, now: datetime.datetime, minutes: int) -> bool:
+        """期限まで0〜minutes分の間ならTrue"""
+        due = self.due_at(now)
+        return due is not None and datetime.timedelta(0) <= due - now <= datetime.timedelta(minutes=minutes)
+
+    def reminder_key(self, now: datetime.datetime) -> tuple:
+        """リマインド済み管理用のキー（uid + 期限日時）"""
+        due = self.due_at(now)
+        return (self.uid, due.strftime("%Y-%m-%dT%H:%M") if due else "")
 
     def format(self) -> str:
         if self.all_day:
@@ -132,6 +160,7 @@ def fetch_events(ics_url: str, filter_words: list, now=None) -> FetchResult:
         log.warning("ICSの解析に失敗: %s", type(e).__name__)
         raise MoodleError("カレンダーデータの解析に失敗しました。") from None
 
+    norm_words = [w for w in (normalize_text(w) for w in filter_words) if w]
     events = []
     total = 0
     upcoming = 0
@@ -148,7 +177,8 @@ def fetch_events(ics_url: str, filter_words: list, now=None) -> FetchResult:
         upcoming += 1
 
         summary = str(component.get("summary", ""))
-        if not any(word in summary for word in filter_words):
+        # フィルターが空なら全予定を対象にする。大文字小文字・全角半角は区別しない。
+        if norm_words and not any(w in normalize_text(summary) for w in norm_words):
             continue
 
         uid = str(component.get("uid", "")) or summary

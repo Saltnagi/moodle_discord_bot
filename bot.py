@@ -1,15 +1,25 @@
 import asyncio
+import datetime
 import logging
+import sys
 
 import discord
 from discord.ext import commands, tasks
 
 import database
 import moodle
-from config import CHECK_INTERVAL_MINUTES, DISCORD_TOKEN
+from config import (
+    CHECK_INTERVAL_MINUTES,
+    DM_RETRY_HOURS,
+    REMINDER_BEFORE_MINUTES,
+    require_token,
+)
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
+
+# トークン未設定ならここで原因を表示して終了する（DBを触る前に確認）
+TOKEN = require_token()
 
 # DBから登録データをロード {user_id: ics_url}
 user_urls = database.init_db()
@@ -54,8 +64,57 @@ def explain_empty(result: moodle.FetchResult, words: list) -> str:
             "これからの予定はありますが、フィルターに一致するものがありません。"
             "`!フィルター` で確認・追加できます。"
         )
-    shown = "、".join(words) if words else "なし"
+    shown = "、".join(words) if words else "なし（すべての予定が対象）"
     return f"現在、これからの予定はありません。\n{reason}\n{stats}\n現在のフィルター: {shown}"
+
+
+def format_with_remaining(ev: moodle.MoodleEvent, now: datetime.datetime) -> str:
+    """期限間近の通知用。予定の表示に「あと◯分」を付ける"""
+    due = ev.due_at(now)
+    minutes = max(int((due - now).total_seconds() // 60), 0) if due else 0
+    return f"{ev.format()}（あと{minutes}分）"
+
+
+async def deliver(user_id: int, header: str, lines: list, now: datetime.datetime) -> bool:
+    """ユーザーにDMで通知する。成功したらTrue。
+
+    DMを拒否されている場合は DM_RETRY_HOURS 時間後まで再送を見送る。
+    """
+    try:
+        user = bot.get_user(user_id) or await bot.fetch_user(user_id)
+        for chunk in chunk_lines(header, lines):
+            await user.send(chunk)
+    except discord.Forbidden:
+        retry_after = now + datetime.timedelta(hours=DM_RETRY_HOURS)
+        database.block_dm(user_id, retry_after)
+        log.warning(
+            "ユーザー %s はDMを受け付けていません。%s 以降に再試行します。",
+            user_id,
+            retry_after.strftime("%Y-%m-%d %H:%M"),
+        )
+        return False
+    except Exception as e:
+        log.warning("ユーザー %s への送信失敗: %s", user_id, e)
+        return False
+    database.clear_dm_block(user_id)
+    return True
+
+
+async def reply_dm(ctx, text: str) -> bool:
+    """コマンドを送った本人のDMにだけ返信する。
+
+    DMを送れなかった場合は、その旨だけをチャンネルに出してFalseを返す
+    （予定の内容はチャンネルに出さない）。
+    """
+    try:
+        await ctx.author.send(text)
+        return True
+    except discord.Forbidden:
+        await ctx.send(
+            f"{ctx.author.mention} DMを送信できませんでした。"
+            "DMの受信設定（サーバーメンバーからのDMを許可）を確認してください。"
+        )
+        return False
 
 
 # --------------------------------------------------
@@ -63,40 +122,58 @@ def explain_empty(result: moodle.FetchResult, words: list) -> str:
 # --------------------------------------------------
 @tasks.loop(minutes=CHECK_INTERVAL_MINUTES)
 async def auto_check_moodle():
+    now = datetime.datetime.now(moodle.JST)
+
     for user_id, target_url in list(user_urls.items()):
+        # DM拒否中のユーザーは、再送予定日時まで取得も通知も見送る
+        if database.is_dm_blocked(user_id, now):
+            continue
+
         # 1. Moodleから取得（同期関数なので別スレッドで実行しBotを止めない）
         words = database.get_filter_words(user_id)
         try:
             result = await asyncio.to_thread(
-                moodle.fetch_events, target_url, words
+                moodle.fetch_events, target_url, words, now
             )
         except moodle.MoodleError as e:
             # 定期通知ではエラーをDMしない（毎回届くとスパムになるため）
             log.warning("ユーザー %s の取得に失敗: %s", user_id, e)
             continue
 
-        # 2. 通知済みを除外
+        # 2. 提出期限が近い予定（未リマインドのもの）があれば、この回はそれだけ通知する
+        reminded = database.get_reminded_keys(user_id)
+        due_soon = [
+            ev
+            for ev in result.events
+            if ev.is_due_soon(now, REMINDER_BEFORE_MINUTES)
+            and ev.reminder_key(now) not in reminded
+        ]
+        if due_soon:
+            ok = await deliver(
+                user_id,
+                f"**【⏰ 提出期限が近い予定（{REMINDER_BEFORE_MINUTES}分以内）】**",
+                [format_with_remaining(ev, now) for ev in due_soon],
+                now,
+            )
+            if ok:
+                database.mark_reminded(user_id, [ev.reminder_key(now) for ev in due_soon])
+                # 新着として重複通知しないよう、通知済みにもしておく
+                database.mark_notified(user_id, [ev.key for ev in due_soon])
+            continue  # 新着の通知は次回のチェックに回す
+
+        # 3. 通常の新着通知（通知済みを除外）
         notified = database.get_notified_keys(user_id)
         new_events = [ev for ev in result.events if ev.key not in notified]
         if not new_events:
             continue
 
-        # 3. DM送信（成功したときだけ通知済みとして記録する）
-        try:
-            user = bot.get_user(user_id) or await bot.fetch_user(user_id)
-            chunks = chunk_lines(
-                "**【定期通知：Moodle 新しい予定】**",
-                [ev.format() for ev in new_events],
-            )
-            for chunk in chunks:
-                await user.send(chunk)
-        except discord.Forbidden:
-            print(
-                f"ユーザー {user_id} はDM受信を許可していないか、Botをブロックしています。"
-            )
-        except Exception as e:
-            print(f"ユーザー {user_id} への送信失敗: {e}")
-        else:
+        # 成功したときだけ通知済みとして記録する
+        if await deliver(
+            user_id,
+            "**【定期通知：Moodle 新しい予定】**",
+            [ev.format() for ev in new_events],
+            now,
+        ):
             database.mark_notified(user_id, [ev.key for ev in new_events])
 
 
@@ -112,33 +189,44 @@ async def on_ready():
 # コマンド各種
 # --------------------------------------------------
 
-# 手動でMoodleの予定を取得するコマンド（通知済みかどうかに関係なく、今後の予定をすべて表示）
+# 手動でMoodleの予定を取得するコマンド
+# （通知済みかどうかに関係なく今後の予定をすべて表示。結果は送信者本人のDMにのみ届く）
 @bot.command(name="moodle")
 async def send_moodle_schedule(ctx):
     user_id = ctx.author.id
+    in_guild = not isinstance(ctx.channel, discord.DMChannel)
     ics_url = user_urls.get(user_id)
 
-    if not ics_url:
-        await ctx.send("❌ MoodleのカレンダーURLが登録されていません。")
+    # 最初のDMで、DMが送れるかも同時に確認する
+    first = (
+        "Moodleから最新の予定を取得中..."
+        if ics_url
+        else "❌ MoodleのカレンダーURLが登録されていません。\nこのBotとのDMで `!url 登録 <URL>` を送信してください。"
+    )
+    if not await reply_dm(ctx, first):
         return
-
-    await ctx.send("Moodleから最新の予定を取得中...")
+    database.clear_dm_block(user_id)  # DMが送れたので、拒否中の記録は解除する
+    if in_guild:
+        await ctx.send(f"{ctx.author.mention} 結果をDMでお送りします📩")
+    if not ics_url:
+        return
 
     words = database.get_filter_words(user_id)
     try:
         result = await asyncio.to_thread(moodle.fetch_events, ics_url, words)
     except moodle.MoodleError as e:
-        await ctx.send(f"❌ {e}")
+        await reply_dm(ctx, f"❌ {e}")
         return
 
     if not result.events:
-        await ctx.send(explain_empty(result, words))
+        await reply_dm(ctx, explain_empty(result, words))
         return
 
     for chunk in chunk_lines(
         "**【Moodle 予定一覧】**", [ev.format() for ev in result.events]
     ):
-        await ctx.send(chunk)
+        if not await reply_dm(ctx, chunk):
+            return
 
 
 # フィルター管理コマンド（フィルターはユーザーごとに保存される）
@@ -160,15 +248,17 @@ async def manage_filter(ctx, action: str = None, word: str = None):
     if action is None:
         if not words:
             await ctx.send(
-                "現在設定されているフィルターキーワードはありません。\n"
-                "※追加する場合: `!フィルター 追加 <単語>`"
+                "現在、フィルターは未設定です。**すべての予定**が通知・表示されます。\n"
+                "※絞り込む場合: `!フィルター 追加 <単語>`"
             )
             return
 
         msg = "**【あなたの通知フィルター設定】**\n"
         for w in words:
             msg += f"・{w}：✅\n"
+        msg += "\n※大文字小文字・全角半角は区別しません"
         msg += "\n※追加する場合: `!フィルター 追加 <単語>`\n※削除する場合: `!フィルター 削除 <単語>`"
+        msg += "\n※すべて削除すると、全予定が通知されます"
         await ctx.send(msg)
 
     # 2. キーワード追加の場合
@@ -177,7 +267,8 @@ async def manage_filter(ctx, action: str = None, word: str = None):
             await ctx.send("追加する単語を指定してください。\n例: `!フィルター 追加 レポート`")
             return
 
-        if word in words:
+        # 大文字小文字・全角半角の違いだけの重複は登録しない
+        if any(moodle.normalize_text(w) == moodle.normalize_text(word) for w in words):
             await ctx.send(f"「{word}」は既に登録されています。")
         else:
             database.add_filter_word(user_id, word)
@@ -189,9 +280,14 @@ async def manage_filter(ctx, action: str = None, word: str = None):
             await ctx.send("削除する単語を指定してください。\n例: `!フィルター 削除 テスト`")
             return
 
-        if word in words:
-            database.delete_filter_word(user_id, word)
-            await ctx.send(f"フィルターから「**{word}**」を削除しました。❌")
+        # 登録時の表記と大文字小文字が違っていても削除できる
+        target = next(
+            (w for w in words if moodle.normalize_text(w) == moodle.normalize_text(word)),
+            None,
+        )
+        if target is not None:
+            database.delete_filter_word(user_id, target)
+            await ctx.send(f"フィルターから「**{target}**」を削除しました。❌")
         else:
             await ctx.send(f"「{word}」は登録されていません。")
 
@@ -230,6 +326,7 @@ async def manage_url(ctx, action: str = None, url: str = None):
         # URLをDBに保存（新規ユーザーならデフォルトのフィルターも登録される）
         user_urls[user_id] = url
         is_new = database.save_user_url(user_id, url)
+        database.clear_dm_block(user_id)  # DMで操作してきたので、拒否中の記録は解除する
         msg = "✅ MoodleのカレンダーURLを登録しました！"
         if is_new:
             msg += "\n通知フィルターは初期設定になっています。`!フィルター` で確認・変更できます。"
@@ -239,10 +336,21 @@ async def manage_url(ctx, action: str = None, url: str = None):
     elif action == "削除":
         if user_id in user_urls:
             del user_urls[user_id]
-            database.delete_user_url(user_id)  # フィルター・通知履歴も削除される
+            database.delete_user_url(user_id)  # フィルター・通知履歴なども削除される
             await ctx.send("🗑️ 登録されていたURLとフィルター設定を削除しました。")
         else:
             await ctx.send("登録されているURLはありません。")
 
 
-bot.run(DISCORD_TOKEN)
+try:
+    bot.run(TOKEN)
+except discord.LoginFailure:
+    sys.exit(
+        "【エラー】DISCORD_TOKEN が無効です。\n"
+        "Discord Developer Portal でトークンを再発行し、.env を更新してください。"
+    )
+except discord.PrivilegedIntentsRequired:
+    sys.exit(
+        "【エラー】MESSAGE CONTENT INTENT が有効になっていません。\n"
+        "Discord Developer Portal の Bot 設定で「Message Content Intent」をオンにしてください。"
+    )
