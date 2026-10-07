@@ -2,45 +2,69 @@
 import datetime
 import logging
 from dataclasses import dataclass
+from typing import Optional
 from zoneinfo import ZoneInfo
- 
+
 import requests
 from icalendar import Calendar
- 
+
 from config import REQUEST_TIMEOUT
- 
+
 log = logging.getLogger(__name__)
- 
+
 JST = ZoneInfo("Asia/Tokyo")
- 
- 
+
+
 class MoodleError(Exception):
     """取得・解析の失敗。メッセージはユーザーに見せても安全な固定文のみ。
- 
+
     MoodleのカレンダーURLには認証トークンが含まれるため、
     requestsの例外メッセージ（URL入り）をそのまま表示してはいけない。
     """
- 
- 
+
+
 @dataclass(frozen=True)
 class MoodleEvent:
     uid: str
     summary: str
     start: datetime.datetime  # JST (aware)
+    end: Optional[datetime.datetime]  # JST (aware)。終了時刻がなければNone
     all_day: bool
- 
+
     @property
     def key(self) -> tuple:
         """通知済み管理用のキー。日時が変わった予定は別物として扱われる。"""
         return (self.uid, self.start.strftime("%Y-%m-%dT%H:%M"))
- 
+
     def format(self) -> str:
-        fmt = "%Y-%m-%d" if self.all_day else "%Y-%m-%d %H:%M"
-        return f"・[{self.start.strftime(fmt)}] {self.summary}"
- 
- 
+        if self.all_day:
+            text = self.start.strftime("%Y-%m-%d")
+            if self.end is not None:
+                # 終日予定のDTENDは「最終日の翌日」を指す
+                last = (self.end - datetime.timedelta(days=1)).date()
+                if last > self.start.date():
+                    text += f" 〜 {last:%Y-%m-%d}"
+        else:
+            text = self.start.strftime("%Y-%m-%d %H:%M")
+            if self.end is not None and self.end > self.start:
+                if self.end.date() == self.start.date():
+                    text += f"〜{self.end:%H:%M}"
+                else:
+                    text += f" 〜 {self.end:%Y-%m-%d %H:%M}"
+        return f"・[{text}] {self.summary}"
+
+
+@dataclass(frozen=True)
+class FetchResult:
+    """取得結果。0件のとき原因を説明できるよう、各段階の件数も持つ。"""
+
+    events: list  # フィルター一致 かつ これからの予定（日時順）
+    total: int  # カレンダー内の予定の総数
+    upcoming: int  # そのうち、これから（または継続中）の予定の数
+
+
 def _to_jst(dt) -> tuple:
-    """dtstartの値をJSTのaware datetimeに揃える。戻り値: (datetime, all_day)"""
+    """日時の値をJSTのaware datetimeに揃える。戻り値: (datetime, all_day)"""
     if isinstance(dt, datetime.datetime):  # datetimeはdateのサブクラスなので先に判定
         if dt.tzinfo is None:
             # タイムゾーンなし（floating）はローカル時刻として扱う
@@ -48,23 +72,44 @@ def _to_jst(dt) -> tuple:
         return dt.astimezone(JST), False
     # 日付のみ（終日予定）。00:00 JST として保持する
     return datetime.datetime.combine(dt, datetime.time.min, tzinfo=JST), True
- 
- 
-def _is_upcoming(start: datetime.datetime, all_day: bool, now: datetime.datetime) -> bool:
+
+
+def _get_end(component, start: datetime.datetime) -> Optional[datetime.datetime]:
+    """DTEND、なければ DURATION から終了時刻を求める"""
+    dtend = component.get("dtend")
+    if dtend is not None:
+        end, _ = _to_jst(dtend.dt)
+        return end
+    duration = component.get("duration")
+    if duration is not None:
+        return start + duration.dt
+    return None
+
+
+def _is_upcoming(
+    start: datetime.datetime,
+    end: Optional[datetime.datetime],
+    all_day: bool,
+    now: datetime.datetime,
+) -> bool:
+    """これから始まる、または今まさに継続中の予定ならTrue"""
     if all_day:
-        # 終日予定は当日いっぱい「これから」の予定として扱う
-        return start.date() >= now.date()
-    return start >= now
- 
- 
-def fetch_events(ics_url: str, filter_words: list, now=None) -> list:
-    """Moodleから予定を取得し、フィルターに一致する「これから」の予定を日時順で返す。
- 
+        last_day = start.date()
+        if end is not None:
+            last_day = max(last_day, (end - datetime.timedelta(days=1)).date())
+        return last_day >= now.date()
+    # 開始が過去でも、終了が未来なら継続中（例: 開いている小テスト）
+    return (max(start, end) if end is not None else start) >= now
+
+
+def fetch_events(ics_url: str, filter_words: list, now=None) -> FetchResult:
+    """Moodleから予定を取得し、フィルターに一致する「これから」の予定を返す。
+
     失敗時は MoodleError を投げる（エラー文を予定として返さない）。
     ネットワーク通信を行う同期関数なので、botからは asyncio.to_thread で呼ぶこと。
     """
     now = now or datetime.datetime.now(JST)
- 
+
     try:
         response = requests.get(ics_url, timeout=REQUEST_TIMEOUT)
     except requests.RequestException as e:
@@ -73,36 +118,47 @@ def fetch_events(ics_url: str, filter_words: list, now=None) -> list:
         raise MoodleError(
             "Moodleに接続できませんでした。時間をおいて再度お試しください。"
         ) from None
- 
+
     if response.status_code != 200:
         log.warning("Moodleが HTTP %s を返しました", response.status_code)
         raise MoodleError(
             f"Moodleからのデータ取得に失敗しました (HTTP {response.status_code})。"
             "カレンダーURLが正しいか確認してください。"
         )
- 
+
     try:
         cal = Calendar.from_ical(response.content)
     except Exception as e:
         log.warning("ICSの解析に失敗: %s", type(e).__name__)
         raise MoodleError("カレンダーデータの解析に失敗しました。") from None
- 
+
     events = []
+    total = 0
+    upcoming = 0
     for component in cal.walk("VEVENT"):
         dtstart = component.get("dtstart")
         if dtstart is None:
             continue
- 
+        total += 1
+
         start, all_day = _to_jst(dtstart.dt)
-        if not _is_upcoming(start, all_day, now):
+        end = _get_end(component, start)
+        if not _is_upcoming(start, end, all_day, now):
             continue
- 
+        upcoming += 1
+
         summary = str(component.get("summary", ""))
         if not any(word in summary for word in filter_words):
             continue
- 
+
         uid = str(component.get("uid", "")) or summary
-        events.append(MoodleEvent(uid=uid, summary=summary, start=start, all_day=all_day))
- 
+        events.append(
+            MoodleEvent(uid=uid, summary=summary, start=start, end=end, all_day=all_day)
+        )
+
     events.sort(key=lambda e: e.start)
-    return events
+    log.info(
+        "ICS解析: 全%d件 / これから%d件 / フィルター一致%d件",
+        total, upcoming, len(events),
+    )
+    return FetchResult(events=events, total=total, upcoming=upcoming)
