@@ -8,6 +8,16 @@ from dotenv import load_dotenv
 load_dotenv()
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 
+
+def _parse_hosts(raw) -> list:
+    """'a.example.jp, B.example.jp' → ['a.example.jp', 'b.example.jp']"""
+    return [h.strip().lower() for h in (raw or "").split(",") if h.strip()]
+
+
+# Botがアクセスしてよいドメイン（.env の MOODLE_ALLOWED_HOSTS で設定。カンマ区切りで複数可）。
+# ここに無いサイトのURLは、登録も取得もできない（SSRF対策）。
+MOODLE_ALLOWED_HOSTS = frozenset(_parse_hosts(os.environ.get("MOODLE_ALLOWED_HOSTS")))
+
 # 起動時のカレントディレクトリに依存しないよう、このファイルの隣にDBを置く
 DB_FILE = str(Path(__file__).parent / "moodle_bot.db")
 
@@ -25,6 +35,12 @@ DM_RETRY_HOURS = 120
 
 # Moodleへのリクエストのタイムアウト（秒）
 REQUEST_TIMEOUT = 10
+
+# --- 入力・通信の上限（悪用や誤入力の対策） ---
+MAX_WORD_LENGTH = 50  # フィルター／除外ワード1つあたりの最大文字数
+MAX_WORDS_PER_LIST = 30  # フィルター／除外ワードそれぞれの最大登録数
+MAX_URL_LENGTH = 2000  # 登録できるURLの最大文字数
+MAX_REDIRECTS = 3  # Moodleからのリダイレクトを追う最大回数（毎回、許可ドメインか検査する）
 
 # --- 定刻通知（毎日この時刻に、今後の予定一覧を送る） ---
 # 初期値。ユーザーごとに !通知時間 で変更できる（時刻は日本時間）
@@ -53,3 +69,25 @@ def require_token() -> str:
             "のいずれかを行ってから、もう一度起動してください。"
         )
     return token
+
+
+def require_allowed_hosts() -> frozenset:
+    """許可ドメインが未設定・不正なら、原因と対処をコンソールに出力して終了する"""
+    hosts = _parse_hosts(os.environ.get("MOODLE_ALLOWED_HOSTS"))
+    if not hosts:
+        sys.exit(
+            "【エラー】MOODLE_ALLOWED_HOSTS が設定されていません。\n"
+            "  ・.env ファイルに  MOODLE_ALLOWED_HOSTS=大学のMoodleのドメイン  を1行追加してください。\n"
+            "    （例: MOODLE_ALLOWED_HOSTS=moodle.example.ac.jp）\n"
+            "  ・ドメインは、MoodleのカレンダーURL（https://◯◯◯/…）の ◯◯◯ の部分です。\n"
+            "Botは、ここに書いたサイト以外のURLにはアクセスしません（セキュリティ対策）。"
+        )
+    bad = [h for h in hosts if any(c in h for c in "/:@ ?#")]
+    if bad:
+        sys.exit(
+            "【エラー】MOODLE_ALLOWED_HOSTS には、https:// やパスを付けず、ドメイン名だけを書いてください。\n"
+            "  誤: https://moodle.example.ac.jp/\n"
+            "  正: moodle.example.ac.jp\n"
+            "  問題のある値: " + ", ".join(bad)
+        )
+    return frozenset(hosts)

@@ -4,12 +4,18 @@ import logging
 import unicodedata
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import urljoin, urlsplit
 from zoneinfo import ZoneInfo
 
 import requests
 from icalendar import Calendar
 
-from config import REQUEST_TIMEOUT
+from config import (
+    MAX_REDIRECTS,
+    MAX_URL_LENGTH,
+    MOODLE_ALLOWED_HOSTS,
+    REQUEST_TIMEOUT,
+)
 
 log = logging.getLogger(__name__)
 
@@ -132,6 +138,63 @@ def _is_upcoming(
     return (max(start, end) if end is not None else start) >= now
 
 
+def check_url(url) -> Optional[str]:
+    """登録・取得してよいURLか検査する。許可なら None、不許可ならユーザーに見せてよい理由を返す。
+
+    SSRF（BotをだましてBotのいるネットワーク内部へアクセスさせる攻撃）の対策として、
+    https かつ、MOODLE_ALLOWED_HOSTS に載っているドメインだけを許可する。
+    """
+    if not isinstance(url, str) or not url:
+        return "URLを入力してください。"
+    if len(url) > MAX_URL_LENGTH:
+        return "URLが長すぎます。"
+    if any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in url):
+        return "URLに使用できない文字が含まれています。"
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return "URLの形式が正しくありません。"
+    if parts.scheme != "https":
+        return "https:// で始まるURLのみ登録できます。"
+    if parts.username is not None or parts.password is not None:
+        return "URLにユーザー名やパスワードを含めることはできません。"
+    host = (parts.hostname or "").lower()
+    if host not in MOODLE_ALLOWED_HOSTS or port not in (None, 443):
+        return "登録できるのは、大学のMoodle（許可されたサイト）のカレンダーURLのみです。"
+    return None
+
+
+_REDIRECT_CODES = (301, 302, 303, 307, 308)
+
+
+def _http_get(ics_url: str):
+    """URLを取得する。リダイレクトは自分で追い、移動先も毎回 check_url で検査する。"""
+    url = ics_url
+    for _ in range(MAX_REDIRECTS + 1):
+        if check_url(url) is not None:
+            # URL自体（認証トークン入り）はログにも出さない
+            log.warning("許可されていないURLへのアクセスをブロックしました")
+            raise MoodleError(
+                "登録されているURLは許可されていません。"
+                "`!url 登録` で、大学のMoodleのカレンダーURLを登録し直してください。"
+            )
+        try:
+            response = requests.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=False)
+        except requests.RequestException as e:
+            # 例外メッセージにURLが入るため、型名だけをログに残す
+            log.warning("Moodle通信エラー: %s", type(e).__name__)
+            raise MoodleError(
+                "Moodleに接続できませんでした。時間をおいて再度お試しください。"
+            ) from None
+        if response.status_code in _REDIRECT_CODES and response.headers.get("Location"):
+            url = urljoin(url, response.headers["Location"])
+            continue
+        return response
+    log.warning("リダイレクトが多すぎるため中断しました")
+    raise MoodleError("Moodleとの通信でリダイレクトが繰り返されました。URLを確認してください。")
+
+
 def fetch_events(
     ics_url: str,
     filter_words: list,
@@ -151,14 +214,7 @@ def fetch_events(
     """
     now = now or datetime.datetime.now(JST)
 
-    try:
-        response = requests.get(ics_url, timeout=REQUEST_TIMEOUT)
-    except requests.RequestException as e:
-        # 例外メッセージにURLが入るため、型名だけをログに残す
-        log.warning("Moodle通信エラー: %s", type(e).__name__)
-        raise MoodleError(
-            "Moodleに接続できませんでした。時間をおいて再度お試しください。"
-        ) from None
+    response = _http_get(ics_url)
 
     if response.status_code != 200:
         log.warning("Moodleが HTTP %s を返しました", response.status_code)

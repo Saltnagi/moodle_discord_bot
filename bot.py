@@ -3,6 +3,7 @@ import datetime
 import logging
 import re
 import sys
+import traceback
 import unicodedata
 from dataclasses import dataclass
 from typing import Optional
@@ -19,24 +20,44 @@ from config import (
     DIGEST_RETRY_MINUTES,
     DM_RETRY_HOURS,
     MAX_NOTIFY_TIMES,
+    MAX_WORD_LENGTH,
+    MAX_WORDS_PER_LIST,
     REMINDER_BEFORE_MINUTES,
     STATUS_MESSAGE,
+    require_allowed_hosts,
     require_token,
 )
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-# トークン未設定ならここで原因を表示して終了する（DBを触る前に確認）
+# 設定が足りなければ、ここで原因を表示して終了する（DBを触る前に確認）
 TOKEN = require_token()
+require_allowed_hosts()
 
 # DBから登録データをロード {user_id: ics_url}
 user_urls = database.init_db()
 
+# 許可ドメイン外のURLが登録されたままのユーザーを、ターミナルに知らせる（通知は届かなくなる）
+for _uid, _url in user_urls.items():
+    if moodle.check_url(_url) is not None:
+        log.warning(
+            "ユーザー %s の登録URLは許可されていない（https以外、または許可ドメイン外）ため、"
+            "通知されません。本人に `!url 登録` のやり直しを案内してください。",
+            _uid,
+        )
+
 intents = discord.Intents.default()
 intents.message_content = True
-# 標準の help コマンドは使わず、下の「!使い方 / !help」を自前で用意する
-bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+# - 標準の help コマンドは使わず、下の「!使い方 / !help」を自前で用意する
+# - allowed_mentions=none: Botの発言に含まれる @everyone や @ユーザー で、実際に通知が飛ばないようにする
+#   （ユーザーが入力した単語をそのままBotが返信に含めるため、メンション悪用の対策）
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents,
+    help_command=None,
+    allowed_mentions=discord.AllowedMentions.none(),
+)
 
 # 定刻通知の取得・送信に失敗したユーザーの、次に再試行してよい時刻（メモリ上のみ）
 _digest_retry_at: dict = {}
@@ -56,10 +77,46 @@ GUIDE_TEXT = (
     "※URLの登録・確認は、このBotとのDMで行ってください。"
 )
 
+URL_GUIDE_TEXT = (
+    "**【MoodleのカレンダーURLの取得方法】**\n"
+    "1. CNSのいずれかの授業から「e-ラーニング」を選び、Moodleへ移動します。\n"
+    "2. 右上のアイコンから「カレンダー」を選択します。\n"
+    "3. ページ下部にある「カレンダーをインポートまたはエクスポートする」を選択します。\n"
+    "4. そのページの「カレンダーをエクスポートする」を選択します。\n"
+    "5. 「エクスポートするイベント」は「すべてのイベント」、「期間」は「最近及び次の60日間」を選択します。\n"
+    "6. その状態で「カレンダーURLを取得する」を選択し、出てきたURLを "
+    "`!url 登録 <URL>` の形で、このBotとのDMに送信します。\n"
+    "\n"
+    "⚠️ このURLは**あなた専用の鍵**です。知られると、あなたの予定を他の人に見られてしまいます。"
+    "サーバーのチャンネルには貼らず、必ずこのBotとのDMで送ってください。\n"
+    "※登録できるのは、大学のMoodleのURL（https://〜）のみです。"
+)
+
+# 最初のDMと !使い方 で、この順に送る
+GUIDE_MESSAGES = (GUIDE_TEXT, URL_GUIDE_TEXT)
+
 
 # --------------------------------------------------
 # 共通の小道具
 # --------------------------------------------------
+_URL_RE = re.compile(r"https?://[^\s'\")>]+")
+_REQ_URL_RE = re.compile(r"(url: )\S+")  # urllib3の「Max retries exceeded with url: /path?...」
+_TOKEN_RE = re.compile(r"(authtoken=)[^&\s'\")]+", re.IGNORECASE)
+
+
+def redact(text: str) -> str:
+    """ログに出す文章から、URLや認証トークンを伏せる"""
+    text = _URL_RE.sub("[URL]", text)
+    text = _REQ_URL_RE.sub(r"\1[URL]", text)
+    return _TOKEN_RE.sub(r"\1[REDACTED]", text)
+
+
+def log_unexpected(context: str, exc: BaseException):
+    """想定外の例外を、URL・トークンを伏せたうえでターミナルに出す"""
+    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    log.error("%s で想定外のエラー:\n%s", context, redact(tb))
+
+
 def chunk_lines(header: str, lines: list, limit: int = 1900) -> list:
     """2000文字制限に収まるよう、行単位でメッセージを分割する。
 
@@ -95,6 +152,23 @@ def parse_days(text: str) -> Optional[int]:
         return None
     days = int(m.group(1))
     return days if 1 <= days <= 365 else None
+
+
+def validate_word(word: str) -> Optional[str]:
+    """フィルター／除外ワードとして登録してよいか検査する。問題なければNone"""
+    if not word:
+        return "空の単語は登録できません。"
+    if len(word) > MAX_WORD_LENGTH:
+        return f"単語は{MAX_WORD_LENGTH}文字以内にしてください。"
+    # 改行や、目に見えない文字（ゼロ幅スペースなど）は受け付けない
+    if any(unicodedata.category(c).startswith("C") for c in word):
+        return "使用できない文字（改行や目に見えない文字など）が含まれています。"
+    return None
+
+
+def short(word: str) -> str:
+    """返信に入力を含めるとき、長すぎる入力で2000文字を超えないように切り詰める"""
+    return word if len(word) <= MAX_WORD_LENGTH else word[:MAX_WORD_LENGTH] + "…"
 
 
 @dataclass(frozen=True)
@@ -184,7 +258,7 @@ async def deliver(user_id: int, header: str, lines: list, now: datetime.datetime
         )
         return False
     except Exception as e:
-        log.warning("ユーザー %s への送信失敗: %s", user_id, e)
+        log.warning("ユーザー %s への送信失敗: %s", user_id, redact(str(e)))
         return False
     database.clear_dm_block(user_id)
     return True
@@ -210,61 +284,70 @@ async def reply_dm(ctx, text: str) -> bool:
 # --------------------------------------------------
 # 定期実行ループ①：新着・期限間近の通知
 # --------------------------------------------------
+async def check_user(user_id: int, target_url: str, now: datetime.datetime):
+    """1人分の自動チェック"""
+    # DM拒否中のユーザーは、再送予定日時まで取得も通知も見送る
+    if database.is_dm_blocked(user_id, now):
+        return
+
+    # 1. Moodleから取得
+    prefs = load_prefs(user_id)
+    try:
+        result = await fetch_for_user(target_url, prefs, now)
+    except moodle.MoodleError as e:
+        # 【重要】自動チェックでは、エラーが起きてもユーザーにDMは送らず、
+        # ターミナル（ログ）にだけ出力する。Moodleの深夜メンテナンスなどで
+        # エラー通知が何通も届くのを防ぐため。復旧後は通常どおり通知される。
+        log.warning("ユーザー %s の取得に失敗: %s", user_id, e)
+        return
+
+    # 2. 提出期限が近い予定（未リマインドのもの）があれば、この回はそれだけ通知する
+    reminded = database.get_reminded_keys(user_id)
+    due_soon = [
+        ev
+        for ev in result.events
+        if ev.is_due_soon(now, REMINDER_BEFORE_MINUTES)
+        and ev.reminder_key(now) not in reminded
+    ]
+    if due_soon:
+        ok = await deliver(
+            user_id,
+            f"**【⏰ 提出期限が近い予定（{REMINDER_BEFORE_MINUTES}分以内）】**",
+            [format_with_remaining(ev, now) for ev in due_soon],
+            now,
+        )
+        if ok:
+            database.mark_reminded(user_id, [ev.reminder_key(now) for ev in due_soon])
+            # 新着として重複通知しないよう、通知済みにもしておく
+            database.mark_notified(user_id, [ev.key for ev in due_soon])
+        return  # 新着の通知は次回のチェックに回す
+
+    # 3. 通常の新着通知（通知済みを除外）
+    notified = database.get_notified_keys(user_id)
+    new_events = [ev for ev in result.events if ev.key not in notified]
+    if not new_events:
+        return
+
+    # 成功したときだけ通知済みとして記録する
+    if await deliver(
+        user_id,
+        "**【定期通知：Moodle 新しい予定】**",
+        [ev.format() for ev in new_events],
+        now,
+    ):
+        database.mark_notified(user_id, [ev.key for ev in new_events])
+
+
 @tasks.loop(minutes=CHECK_INTERVAL_MINUTES)
 async def auto_check_moodle():
     now = datetime.datetime.now(moodle.JST)
-
     for user_id, target_url in list(user_urls.items()):
-        # DM拒否中のユーザーは、再送予定日時まで取得も通知も見送る
-        if database.is_dm_blocked(user_id, now):
-            continue
-
-        # 1. Moodleから取得
-        prefs = load_prefs(user_id)
         try:
-            result = await fetch_for_user(target_url, prefs, now)
-        except moodle.MoodleError as e:
-            # 【重要】自動チェックでは、エラーが起きてもユーザーにDMは送らず、
-            # ターミナル（ログ）にだけ出力する。Moodleの深夜メンテナンスなどで
-            # エラー通知が何通も届くのを防ぐため。復旧後は通常どおり通知される。
-            log.warning("ユーザー %s の取得に失敗: %s", user_id, e)
-            continue
-
-        # 2. 提出期限が近い予定（未リマインドのもの）があれば、この回はそれだけ通知する
-        reminded = database.get_reminded_keys(user_id)
-        due_soon = [
-            ev
-            for ev in result.events
-            if ev.is_due_soon(now, REMINDER_BEFORE_MINUTES)
-            and ev.reminder_key(now) not in reminded
-        ]
-        if due_soon:
-            ok = await deliver(
-                user_id,
-                f"**【⏰ 提出期限が近い予定（{REMINDER_BEFORE_MINUTES}分以内）】**",
-                [format_with_remaining(ev, now) for ev in due_soon],
-                now,
-            )
-            if ok:
-                database.mark_reminded(user_id, [ev.reminder_key(now) for ev in due_soon])
-                # 新着として重複通知しないよう、通知済みにもしておく
-                database.mark_notified(user_id, [ev.key for ev in due_soon])
-            continue  # 新着の通知は次回のチェックに回す
-
-        # 3. 通常の新着通知（通知済みを除外）
-        notified = database.get_notified_keys(user_id)
-        new_events = [ev for ev in result.events if ev.key not in notified]
-        if not new_events:
-            continue
-
-        # 成功したときだけ通知済みとして記録する
-        if await deliver(
-            user_id,
-            "**【定期通知：Moodle 新しい予定】**",
-            [ev.format() for ev in new_events],
-            now,
-        ):
-            database.mark_notified(user_id, [ev.key for ev in new_events])
+            await check_user(user_id, target_url, now)
+        except Exception as e:
+            # 1人分の処理で想定外のエラーが出ても、他のユーザーの処理を止めない。
+            # （ループが止まると全員の通知が止まるため）。URL・トークンは伏せてログに出す。
+            log_unexpected(f"ユーザー {user_id} の自動チェック", e)
 
 
 # --------------------------------------------------
@@ -292,56 +375,65 @@ def due_slots(user_id: int, now: datetime.datetime) -> list:
     return result
 
 
+async def digest_user(user_id: int, target_url: str, now: datetime.datetime):
+    """1人分の定刻通知"""
+    if database.is_dm_blocked(user_id, now):
+        return
+
+    due = due_slots(user_id, now)
+    if not due:
+        return
+    # 失敗直後は、DIGEST_RETRY_MINUTES 分あけてから再試行する（Moodleを連打しない）
+    if now < _digest_retry_at.get(user_id, now):
+        return
+
+    prefs = load_prefs(user_id)
+    try:
+        result = await fetch_for_user(target_url, prefs, now)
+    except moodle.MoodleError as e:
+        # 自動処理なので、エラーはDMせずターミナルにのみ出力する
+        log.warning("ユーザー %s の定刻通知の取得に失敗: %s", user_id, e)
+        _digest_retry_at[user_id] = now + datetime.timedelta(minutes=DIGEST_RETRY_MINUTES)
+        return
+
+    # 定刻通知に載せるのは「今後 days 日以内」の予定。ユーザーの期間設定が短ければそちらを優先
+    days = min(prefs.max_days, DIGEST_MAX_DAYS) if prefs.max_days else DIGEST_MAX_DAYS
+    horizon = now + datetime.timedelta(days=days)
+    events = [ev for ev in result.events if ev.start <= horizon]
+
+    # 予定が1件もない回は送らない（空の通知で煩わせない）。その回は送信済みとして扱う
+    if events:
+        latest_hhmm = max(hhmm for _, hhmm in due)
+        ok = await deliver(
+            user_id,
+            f"**【📅 定刻通知 {latest_hhmm}：今後{days}日間の予定】**",
+            [ev.format() for ev in events],
+            now,
+        )
+        if not ok:
+            if database.is_dm_blocked(user_id, now):
+                pass  # DM拒否 → 再送は120時間後。この回は諦める
+            else:
+                # Discord側の一時的な不調など。少し待って再試行する
+                _digest_retry_at[user_id] = now + datetime.timedelta(
+                    minutes=DIGEST_RETRY_MINUTES
+                )
+                return
+
+    database.mark_digest_sent(user_id, [slot for slot, _ in due])
+    _digest_retry_at.pop(user_id, None)
+
+
 @tasks.loop(minutes=1)
 async def scheduled_digest():
     now = datetime.datetime.now(moodle.JST)
-
     for user_id, target_url in list(user_urls.items()):
-        if database.is_dm_blocked(user_id, now):
-            continue
-
-        due = due_slots(user_id, now)
-        if not due:
-            continue
-        # 失敗直後は、DIGEST_RETRY_MINUTES 分あけてから再試行する（Moodleを連打しない）
-        if now < _digest_retry_at.get(user_id, now):
-            continue
-
-        prefs = load_prefs(user_id)
         try:
-            result = await fetch_for_user(target_url, prefs, now)
-        except moodle.MoodleError as e:
-            # 自動処理なので、エラーはDMせずターミナルにのみ出力する
-            log.warning("ユーザー %s の定刻通知の取得に失敗: %s", user_id, e)
+            await digest_user(user_id, target_url, now)
+        except Exception as e:
+            # 1人分の想定外のエラーで、他のユーザーの定刻通知を止めない
+            log_unexpected(f"ユーザー {user_id} の定刻通知", e)
             _digest_retry_at[user_id] = now + datetime.timedelta(minutes=DIGEST_RETRY_MINUTES)
-            continue
-
-        # 定刻通知に載せるのは「今後 days 日以内」の予定。ユーザーの期間設定が短ければそちらを優先
-        days = min(prefs.max_days, DIGEST_MAX_DAYS) if prefs.max_days else DIGEST_MAX_DAYS
-        horizon = now + datetime.timedelta(days=days)
-        events = [ev for ev in result.events if ev.start <= horizon]
-
-        # 予定が1件もない回は送らない（空の通知で煩わせない）。その回は送信済みとして扱う
-        if events:
-            latest_hhmm = max(hhmm for _, hhmm in due)
-            ok = await deliver(
-                user_id,
-                f"**【📅 定刻通知 {latest_hhmm}：今後{days}日間の予定】**",
-                [ev.format() for ev in events],
-                now,
-            )
-            if not ok:
-                if database.is_dm_blocked(user_id, now):
-                    pass  # DM拒否 → 再送は120時間後。この回は諦める
-                else:
-                    # Discord側の一時的な不調など。少し待って再試行する
-                    _digest_retry_at[user_id] = now + datetime.timedelta(
-                        minutes=DIGEST_RETRY_MINUTES
-                    )
-                    continue
-
-        database.mark_digest_sent(user_id, [slot for slot, _ in due])
-        _digest_retry_at.pop(user_id, None)
 
 
 # --------------------------------------------------
@@ -373,9 +465,10 @@ async def on_message(message):
             ctx = await bot.get_context(message)
             if ctx.command is None or ctx.command.name != "使い方":
                 try:
-                    await message.channel.send(GUIDE_TEXT)
+                    for text in GUIDE_MESSAGES:
+                        await message.channel.send(text)
                 except Exception as e:
-                    log.warning("ユーザー %s へのガイド送信失敗: %s", user_id, e)
+                    log.warning("ユーザー %s へのガイド送信失敗: %s", user_id, type(e).__name__)
 
     await bot.process_commands(message)
 
@@ -384,10 +477,11 @@ async def on_message(message):
 # コマンド各種
 # --------------------------------------------------
 
-# 使い方ガイド
+# 使い方ガイド（Botの使い方 + URLの取得方法）
 @bot.command(name="使い方", aliases=["help"])
 async def show_help(ctx):
-    await ctx.send(GUIDE_TEXT)
+    for text in GUIDE_MESSAGES:
+        await ctx.send(text)
 
 
 # 手動でMoodleの予定を取得するコマンド
@@ -402,7 +496,8 @@ async def send_moodle_schedule(ctx):
     first = (
         "Moodleから最新の予定を取得中..."
         if ics_url
-        else "❌ MoodleのカレンダーURLが登録されていません。\nこのBotとのDMで `!url 登録 <URL>` を送信してください。"
+        else "❌ MoodleのカレンダーURLが登録されていません。\n"
+        "このBotとのDMで `!url 登録 <URL>` を送信してください。取得方法は `!使い方` で確認できます。"
     )
     if not await reply_dm(ctx, first):
         return
@@ -476,9 +571,19 @@ async def manage_word_list(
         if word is None:
             await ctx.send(f"追加する単語を指定してください。\n例: `!{cmd} 追加 レポート`")
             return
+        word = word.strip()
+        problem = validate_word(word)
+        if problem:
+            await ctx.send(f"❌ {problem}")
+            return
         # 大文字小文字・全角半角の違いだけの重複は登録しない
         if any(moodle.normalize_text(w) == moodle.normalize_text(word) for w in words):
             await ctx.send(f"「{word}」は既に登録されています。")
+        elif len(words) >= MAX_WORDS_PER_LIST:
+            await ctx.send(
+                f"❌ 登録できるのは最大{MAX_WORDS_PER_LIST}個までです。"
+                f"不要なものを `!{cmd} 削除 <単語>` で削除してから追加してください。"
+            )
         else:
             add_word(user_id, word)
             await ctx.send(added_text.format(word=word))
@@ -497,7 +602,7 @@ async def manage_word_list(
             delete_word(user_id, target)
             await ctx.send(removed_text.format(word=target))
         else:
-            await ctx.send(f"「{word}」は登録されていません。")
+            await ctx.send(f"「{short(word)}」は登録されていません。")
 
     else:
         await ctx.send(
@@ -672,9 +777,31 @@ async def manage_url(ctx, action: str = None, url: str = None):
 
     # コマンドの送信先がDM（プライベートチャット）かチェック
     if not isinstance(ctx.channel, discord.DMChannel):
-        await ctx.send(
-            f"{ctx.author.mention} セキュリティのため、URLの登録・確認はBotとの**DM（ダイレクトメッセージ）**で行ってください！"
+        # URL（認証トークン入り）をサーバーのチャンネルに送ってしまった場合は、
+        # 公開されたままにならないよう、そのメッセージの削除を試みる
+        deleted = False
+        if url is not None:
+            try:
+                await ctx.message.delete()
+                deleted = True
+            except Exception as e:  # 権限不足（Manage Messages）など
+                log.warning("URLを含むメッセージを削除できませんでした: %s", type(e).__name__)
+        msg = (
+            f"{ctx.author.mention} セキュリティのため、URLの登録・確認は"
+            "Botとの**DM（ダイレクトメッセージ）**で行ってください！"
         )
+        if url is not None:
+            if deleted:
+                msg += (
+                    "\n⚠️ URLを含むメッセージは削除しましたが、一度公開された可能性があります。"
+                    "念のため、MoodleでURLを取得し直して（可能なら古いURLを無効にして）から、DMで登録してください。"
+                )
+            else:
+                msg += (
+                    "\n⚠️ URLを含むメッセージを削除できませんでした。**お手数ですがご自身で削除**し、"
+                    "MoodleでURLを取得し直してから、DMで登録してください。"
+                )
+        await ctx.send(msg)
         return
 
     # 1. 引数なし：登録状況の確認
@@ -685,15 +812,21 @@ async def manage_url(ctx, action: str = None, url: str = None):
             )
         else:
             await ctx.send(
-                "❌ URLが登録されていません。\n`!url 登録 <Moodleの.ics URL>` と送信して登録してください。"
+                "❌ URLが登録されていません。\n`!url 登録 <Moodleの.ics URL>` と送信して登録してください。\n"
+                "取得方法は `!使い方` で確認できます。"
             )
 
     # 2. URLの登録
     elif action == "登録":
-        if url is None or not (
-            url.startswith("http://") or url.startswith("https://")
-        ):
-            await ctx.send("有効なURLを入力してください。\n例: `!url 登録 https://...`")
+        if url is None:
+            await ctx.send(
+                "URLを指定してください。\n例: `!url 登録 https://...`\n取得方法は `!使い方` で確認できます。"
+            )
+            return
+        # https かつ許可ドメインのURLだけを受け付ける（入力されたURLは返信に含めない）
+        problem = moodle.check_url(url)
+        if problem:
+            await ctx.send(f"❌ {problem}\n取得方法は `!使い方` で確認できます。")
             return
 
         # URLをDBに保存（新規ユーザーならデフォルトのフィルターも登録される）
