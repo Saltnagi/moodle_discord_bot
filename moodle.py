@@ -43,6 +43,7 @@ class MoodleEvent:
     start: datetime.datetime  # JST (aware)
     end: Optional[datetime.datetime]  # JST (aware)。終了時刻がなければNone
     all_day: bool
+    course: str = ""  # 授業名（Moodleのカレンダーに含まれるコース略称）。情報がなければ空
 
     @property
     def key(self) -> tuple:
@@ -85,7 +86,8 @@ class MoodleEvent:
                     text += f"〜{self.end:%H:%M}"
                 else:
                     text += f" 〜 {self.end:%Y-%m-%d %H:%M}"
-        return f"・[{text}] {self.summary}"
+        prefix = f"【{self.course}】" if self.course else ""
+        return f"・[{text}] {prefix}{self.summary}"
 
 
 @dataclass(frozen=True)
@@ -108,6 +110,33 @@ def _to_jst(dt) -> tuple:
         return dt.astimezone(JST), False
     # 日付のみ（終日予定）。00:00 JST として保持する
     return datetime.datetime.combine(dt, datetime.time.min, tzinfo=JST), True
+
+
+_MAX_COURSE_LENGTH = 40
+
+
+def _get_course(component) -> str:
+    """予定の「授業名」を取り出す。
+
+    MoodleのカレンダーはコースのイベントにCATEGORIES（コース略称）を付けて出力する。
+    CATEGORIESが無い予定（個人の予定など）は空文字を返す。
+    ライブラリのバージョンにより値の型が違うため、いくつかの形に対応している。
+    """
+    cats = component.get("categories")
+    if cats is None:
+        return ""
+    names = []
+    for item in cats if isinstance(cats, list) else [cats]:
+        values = getattr(item, "cats", None)  # icalendar の vCategory
+        for v in values if values is not None else [item]:
+            text = " ".join(str(v).split())  # 改行などを空白1つにまとめる
+            text = "".join(ch for ch in text if ch.isprintable())
+            if text and text not in names:
+                names.append(text)
+    course = " / ".join(names)
+    if len(course) > _MAX_COURSE_LENGTH:
+        course = course[:_MAX_COURSE_LENGTH] + "…"
+    return course
 
 
 def _get_end(component, start: datetime.datetime) -> Optional[datetime.datetime]:
@@ -264,7 +293,9 @@ def fetch_events(
             continue
 
         summary = str(component.get("summary", ""))
-        norm_summary = normalize_text(summary)
+        course = _get_course(component)
+        # フィルター・除外は「予定名」と「授業名」の両方が対象（授業名で絞り込めるように）
+        norm_summary = normalize_text(f"{summary} {course}")
 
         # フィルターが空なら全予定を対象にする
         if norm_words and not any(w in norm_summary for w in norm_words):
@@ -276,7 +307,9 @@ def fetch_events(
 
         uid = str(component.get("uid", "")) or summary
         events.append(
-            MoodleEvent(uid=uid, summary=summary, start=start, end=end, all_day=all_day)
+            MoodleEvent(
+                uid=uid, summary=summary, start=start, end=end, all_day=all_day, course=course
+            )
         )
 
     events.sort(key=lambda e: e.start)
