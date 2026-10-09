@@ -49,7 +49,7 @@
 ## botの起動方法
 1. 管理者権限で、ターミナルを起動
 2. 【cd C:\Users\drdai\Downloads\キャリアハウス関連\Moodle_system_bot】で移動
-3.【.venv\Scripts\activate.bat】ここで、行頭に(.venv)と表示されたら成功
+3. 【.venv\Scripts\activate.bat】ここで、行頭に(.venv)と表示されたら成功
 
 4. 【python bot.py】を実行
 色々文章が出たのち、ターミナルに「Botが開通しました：Moodle通知Bot」が出ると起動完了
