@@ -43,7 +43,8 @@ class MoodleEvent:
     start: datetime.datetime  # JST (aware)
     end: Optional[datetime.datetime]  # JST (aware)。終了時刻がなければNone
     all_day: bool
-    course: str = ""  # 授業名（Moodleのカレンダーに含まれるコース略称）。情報がなければ空
+    course: str = ""  # 通知に表示する授業名（日本語のもののみ）。取得できなければ空
+    course_code: str = ""  # Moodleのコース略称（例: 2026UCS258）。表示せず、絞り込みにだけ使う
 
     @property
     def key(self) -> tuple:
@@ -137,6 +138,28 @@ def _get_course(component) -> str:
     if len(course) > _MAX_COURSE_LENGTH:
         course = course[:_MAX_COURSE_LENGTH] + "…"
     return course
+
+
+def _has_japanese(text: str) -> bool:
+    """ひらがな・カタカナ・漢字（半角カタカナを含む）が1文字でもあればTrue"""
+    return any(
+        "\u3040" <= ch <= "\u30ff"  # ひらがな・カタカナ
+        or "\u3400" <= ch <= "\u4dbf"  # 漢字（拡張A）
+        or "\u4e00" <= ch <= "\u9fff"  # 漢字
+        or "\uff66" <= ch <= "\uff9f"  # 半角カタカナ
+        for ch in text
+    )
+
+
+def display_course(course_raw: str) -> str:
+    """通知に表示する授業名を選ぶ。
+
+    Moodleのカレンダーに入っているのは「2026UCS258」のような科目コードのことが多く、
+    それを表示しても何の授業か分からない。そのため、日本語を含むものだけを表示し、
+    英数字だけのコードは表示しない（取得できなければ空文字）。
+    """
+    names = [n for n in course_raw.split(" / ") if _has_japanese(n)]
+    return " / ".join(names)
 
 
 def _get_end(component, start: datetime.datetime) -> Optional[datetime.datetime]:
@@ -293,9 +316,11 @@ def fetch_events(
             continue
 
         summary = str(component.get("summary", ""))
-        course = _get_course(component)
-        # フィルター・除外は「予定名」と「授業名」の両方が対象（授業名で絞り込めるように）
-        norm_summary = normalize_text(f"{summary} {course}")
+        course_raw = _get_course(component)  # コース略称。表示には使わない
+        course = display_course(course_raw)  # 日本語の授業名だけ。無ければ空
+        # フィルター・除外は「予定名」「授業名」「コース略称（コード）」が対象
+        # （コードで絞り込めるよう、表示しないコードも照合には使う）
+        norm_summary = normalize_text(f"{summary} {course_raw}")
 
         # フィルターが空なら全予定を対象にする
         if norm_words and not any(w in norm_summary for w in norm_words):
@@ -308,7 +333,13 @@ def fetch_events(
         uid = str(component.get("uid", "")) or summary
         events.append(
             MoodleEvent(
-                uid=uid, summary=summary, start=start, end=end, all_day=all_day, course=course
+                uid=uid,
+                summary=summary,
+                start=start,
+                end=end,
+                all_day=all_day,
+                course=course,
+                course_code=course_raw,
             )
         )
 
