@@ -516,7 +516,7 @@ def fetch_ics_limited(
             log.warning("Moodleの応答がICS形式ではありません（メンテナンス中またはログイン画面の可能性）")
             raise MoodleError(
                 "Moodleからカレンダーデータを受け取れませんでした（メンテナンス中等の可能性があります）。",
-                FailureKind.INVALID,
+                FailureKind.SUSPECT,
             )
 
         return content
