@@ -7,6 +7,7 @@ from config import (
     HEALTH_ANY_AFTER_HOURS,
     HEALTH_INVALID_AFTER_MIN,
     HEALTH_PROBE_INTERVAL_MIN,
+    HEALTH_SUSPECT_AFTER_HOURS,
 )
 from errors import FailureKind
 
@@ -78,9 +79,13 @@ def record_failure(user_id: int, kind: FailureKind, now: datetime) -> HealthActi
             kind == FailureKind.INVALID
             and elapsed >= timedelta(minutes=HEALTH_INVALID_AFTER_MIN)
         )
-        cond_b = elapsed >= timedelta(hours=HEALTH_ANY_AFTER_HOURS)
+        cond_b = (
+            kind == FailureKind.SUSPECT
+            and elapsed >= timedelta(hours=HEALTH_SUSPECT_AFTER_HOURS)
+        )
+        cond_c = elapsed >= timedelta(hours=HEALTH_ANY_AFTER_HOURS)
 
-        if cond_a or cond_b:
+        if cond_a or cond_b or cond_c:
             action = HealthAction.NOTIFY_INVALID
             notified_at_str = now_str
 

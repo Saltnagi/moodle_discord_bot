@@ -555,7 +555,7 @@ def fetch_events(
         cal = Calendar.from_ical(content)
     except Exception as e:
         log.warning("ICSの解析に失敗: %s", type(e).__name__)
-        raise MoodleError("カレンダーデータの解析に失敗しました。", FailureKind.INVALID) from None
+        raise MoodleError("カレンダーデータの解析に失敗しました。", FailureKind.SUSPECT) from None
 
     norm_words = [w for w in (normalize_text(w) for w in filter_words) if w]
     norm_excludes = [w for w in (normalize_text(w) for w in (exclude_words or [])) if w]

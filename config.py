@@ -65,6 +65,7 @@ DIGEST_MAX_DAYS = 7
 HEALTH_INVALID_AFTER_MIN = 180        # INVALID が継続したら案内（分）
 HEALTH_ANY_AFTER_HOURS = 24           # 種別を問わず継続したら案内（時間）
 HEALTH_PROBE_INTERVAL_MIN = 360       # 案内後の再試行間隔（分）
+HEALTH_SUSPECT_AFTER_HOURS = 12     # SUSPECT が継続したら案内（時間）
 
 # --- 並行制御・運用 ---
 FETCH_CONCURRENCY = 5

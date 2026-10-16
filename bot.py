@@ -58,6 +58,14 @@ except Exception:
 TOKEN = require_token()
 require_allowed_hosts()
 
+# 多重起動の防止。DBに触れる前に取得し、プロセスが終わるまで保持する（終了時はOSが自動解放）
+os.makedirs(DATA_DIR, exist_ok=True)
+_instance_lock = SingleInstanceLock(LOCK_FILE)
+try:
+    _instance_lock.acquire()
+except AlreadyRunningError:
+    sys.exit("【エラー】すでに別のプロセスでBotが起動中です。二重起動を防ぐため終了します。")
+
 # DBから登録データをロード {user_id: ics_url}
 user_urls = database.init_db()
 
@@ -235,11 +243,11 @@ async def notify_admin(text: str) -> None:
         log.warning("管理者 %s へのDM送信に失敗: %s", ADMIN_USER_ID, type(e).__name__)
 
 
-async def handle_health_action(user: discord.User, action: health_module.HealthAction) -> None:
+async def handle_health_action(user_id: int, action: health_module.HealthAction) -> None:
     """
     NOTIFY_INVALID  : URLが無効の可能性をDM（URLは書かない）
     NOTIFY_RECOVERED: 復旧DM
-    DM失敗（Forbidden等）は握りつぶす
+    DM失敗（Forbidden等）は握りつぶす。Discordのユーザー取得は、DMが必要なときだけ行う。
     """
     if action == health_module.HealthAction.NOTIFY_INVALID:
         msg = (
@@ -252,24 +260,26 @@ async def handle_health_action(user: discord.User, action: health_module.HealthA
         msg = "✅ Moodleの通知を再開しました。"
     else:
         return
+
     try:
+        user = bot.get_user(user_id) or await bot.fetch_user(user_id)
         await user.send(msg)
     except (discord.Forbidden, discord.HTTPException):
         pass
     except Exception as e:
-        log.warning("ヘルスアクションのDM送信に失敗 (user=%s): %s", user.id, type(e).__name__)
+        log.warning("ヘルスアクションのDM送信に失敗 (user=%s): %s", user_id, type(e).__name__)
 
 
 async def fetch_for_user_with_health(
-    discord_user: discord.User,
+    user_id: int,
     url: str,
     prefs: "Prefs",
     now: datetime.datetime,
 ) -> Optional[moodle.FetchResult]:
-    """ヘルスチェック統合版の取得関数。失敗はhealth_moduleで管理し、必要時DMする。"""
+    """自動処理用の取得。失敗は health_module で管理し、必要なときだけ案内DMを送る。
+    失敗、またはヘルスチェックによる取得見送りのときは None を返す。"""
     now_utc = now.astimezone(timezone.utc)
-
-    if not health_module.should_fetch(discord_user.id, now_utc):
+    if not health_module.should_fetch(user_id, now_utc):
         return None
 
     try:
@@ -283,12 +293,14 @@ async def fetch_for_user_with_health(
             course_resolver,
         )
     except MoodleError as e:
-        action = health_module.record_failure(discord_user.id, e.kind, now_utc)
-        await handle_health_action(discord_user, action)
+        # 自動処理なので、エラーそのものはDMせずログにだけ出す（メンテナンス中の連投防止）
+        log.warning("ユーザー %s の取得に失敗 (%s): %s", user_id, e.kind.value, e)
+        action = health_module.record_failure(user_id, e.kind, now_utc)
+        await handle_health_action(user_id, action)
         return None
 
-    action = health_module.record_success(discord_user.id, now_utc)
-    await handle_health_action(discord_user, action)
+    action = health_module.record_success(user_id, now_utc)
+    await handle_health_action(user_id, action)
     return result
 
 
@@ -801,6 +813,14 @@ async def auto_check_moodle():
             # （ループが止まると全員の通知が止まるため）。URL・トークンは伏せてログに出す。
             log_unexpected(f"ユーザー {user_id} の自動チェック", e)
 
+    # シラバス障害（解析失敗の連続）があれば、管理者に1回だけ知らせる
+    try:
+        alert = syllabus.syllabus_health.consume_alert(now)
+        if alert:
+            await notify_admin(alert)
+    except Exception as e:
+        log_unexpected("シラバス管理者アラート", e)
+
 
 # --------------------------------------------------
 # 定期実行ループ②：定刻通知（毎日、設定した時刻に今後の予定一覧を送る）
@@ -840,11 +860,9 @@ async def digest_user(user_id: int, target_url: str, now: datetime.datetime):
         return
 
     prefs = load_prefs(user_id)
-    try:
-        result = await fetch_for_user(target_url, prefs, now)
-    except moodle.MoodleError as e:
-        # 自動処理なので、エラーはDMせずターミナルにのみ出力する
-        log.warning("ユーザー %s の定刻通知の取得に失敗: %s", user_id, e)
+    result = await fetch_for_user_with_health(user_id, target_url, prefs, now)
+    if result is None:
+        # 失敗、またはヘルスチェックによる取得見送り。少し待ってから再試行する
         _digest_retry_at[user_id] = now + datetime.timedelta(minutes=DIGEST_RETRY_MINUTES)
         return
 
