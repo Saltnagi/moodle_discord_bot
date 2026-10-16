@@ -1,11 +1,13 @@
 import asyncio
 import datetime
 import logging
+import os
 import re
 import sys
 import traceback
 import unicodedata
 from dataclasses import dataclass
+from datetime import timezone
 from typing import Callable, Optional
 
 import discord
@@ -13,28 +15,44 @@ from discord import app_commands
 from discord.ext import tasks
 
 import database
+import health as health_module
 import moodle
 import syllabus
 from config import (
+    ADMIN_USER_ID,
     CHECK_INTERVAL_MINUTES,
     COMMANDS_VERSION,
+    DATA_DIR,
     DIGEST_GRACE_MINUTES,
     DIGEST_MAX_DAYS,
     DIGEST_RETRY_MINUTES,
     DM_RETRY_HOURS,
+    FETCH_CONCURRENCY,
+    LOCK_FILE,
     MAX_NOTIFY_TIMES,
     MAX_URL_LENGTH,
     MAX_WORD_LENGTH,
     MAX_WORDS_PER_LIST,
     REMINDER_BEFORE_MINUTES,
+    RETENTION_DAYS,
     STATUS_MESSAGE,
     SYNC_COMMANDS,
     require_allowed_hosts,
     require_token,
 )
+from errors import MoodleError
+from single_instance import AlreadyRunningError, SingleInstanceLock
 
-logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
+
+
+# ログとデータディレクトリのセットアップ（DB初期化より先に）
+try:
+    import logging_setup
+    _log_dir = os.path.join(DATA_DIR, "logs")
+    logging_setup.setup_logging(_log_dir)
+except Exception:
+    logging.basicConfig(level=logging.INFO)
 
 # 設定が足りなければ、ここで原因を表示して終了する（DBを触る前に確認）
 TOKEN = require_token()
@@ -206,8 +224,76 @@ syllabus_client = syllabus.YamanashiSyllabusClient()
 course_resolver = syllabus.CourseNameResolver(syllabus_client)
 
 
-async def fetch_for_user(url: str, prefs: Prefs, now=None) -> moodle.FetchResult:
-    """同期関数のfetch_eventsを別スレッドで実行し、Botを止めない"""
+async def notify_admin(text: str) -> None:
+    """ADMIN_USER_ID が未設定なら何もしない。DM失敗は握りつぶしてログのみ"""
+    if not ADMIN_USER_ID:
+        return
+    try:
+        user = bot.get_user(ADMIN_USER_ID) or await bot.fetch_user(ADMIN_USER_ID)
+        await user.send(text)
+    except Exception as e:
+        log.warning("管理者 %s へのDM送信に失敗: %s", ADMIN_USER_ID, type(e).__name__)
+
+
+async def handle_health_action(user: discord.User, action: health_module.HealthAction) -> None:
+    """
+    NOTIFY_INVALID  : URLが無効の可能性をDM（URLは書かない）
+    NOTIFY_RECOVERED: 復旧DM
+    DM失敗（Forbidden等）は握りつぶす
+    """
+    if action == health_module.HealthAction.NOTIFY_INVALID:
+        msg = (
+            "⚠️ **MoodleのカレンダーURLが無効になっている可能性があります。**\n"
+            "しばらく通知が届かない場合は、Moodleでカレンダーのエクスポート用URLを"
+            "取得し直し、`/url 登録` で再登録してください。\n"
+            "（URLには認証トークンが含まれているため、Moodleのパスワード変更等で無効になることがあります）"
+        )
+    elif action == health_module.HealthAction.NOTIFY_RECOVERED:
+        msg = "✅ Moodleの通知を再開しました。"
+    else:
+        return
+    try:
+        await user.send(msg)
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+    except Exception as e:
+        log.warning("ヘルスアクションのDM送信に失敗 (user=%s): %s", user.id, type(e).__name__)
+
+
+async def fetch_for_user_with_health(
+    discord_user: discord.User,
+    url: str,
+    prefs: "Prefs",
+    now: datetime.datetime,
+) -> Optional[moodle.FetchResult]:
+    """ヘルスチェック統合版の取得関数。失敗はhealth_moduleで管理し、必要時DMする。"""
+    now_utc = now.astimezone(timezone.utc)
+
+    if not health_module.should_fetch(discord_user.id, now_utc):
+        return None
+
+    try:
+        result = await asyncio.to_thread(
+            moodle.fetch_events,
+            url,
+            prefs.words,
+            now,
+            prefs.excludes,
+            prefs.max_days,
+            course_resolver,
+        )
+    except MoodleError as e:
+        action = health_module.record_failure(discord_user.id, e.kind, now_utc)
+        await handle_health_action(discord_user, action)
+        return None
+
+    action = health_module.record_success(discord_user.id, now_utc)
+    await handle_health_action(discord_user, action)
+    return result
+
+
+async def fetch_for_user(url: str, prefs: "Prefs", now=None) -> moodle.FetchResult:
+    """既存の手動コマンド（/moodle）から呼ばれる版。ヘルス管理なし・MoodleErrorをそのまま伝播。"""
     return await asyncio.to_thread(
         moodle.fetch_events,
         url,
@@ -217,6 +303,7 @@ async def fetch_for_user(url: str, prefs: Prefs, now=None) -> moodle.FetchResult
         prefs.max_days,
         course_resolver,
     )
+
 
 
 def explain_empty(result: moodle.FetchResult, prefs: Prefs) -> str:
@@ -367,6 +454,7 @@ def register_url(user_id: int, url: str) -> tuple:
     user_urls[user_id] = url
     is_new = database.save_user_url(user_id, url)
     database.clear_dm_block(user_id)  # 本人が操作してきたので、DM拒否中の記録は解除する
+    health_module.reset(user_id)  # URL更新でヘルス状態をリセット
     message = (
         "✅ MoodleのカレンダーURLを登録しました！"
         if is_new
@@ -385,7 +473,8 @@ def url_delete_text(user_id: int) -> str:
     if user_id not in user_urls:
         return "登録されているURLはありません。"
     del user_urls[user_id]
-    database.delete_user_url(user_id)  # フィルター・設定・通知履歴なども削除される
+    database.delete_user_url(user_id)  # フィルター・設定・通知履歴なども削除される（user_healthも含む）
+    health_module.reset(user_id)  # メモリ上のヘルス状態もリセット
     return "🗑️ 登録されていたURLと各種設定を削除しました。"
 
 

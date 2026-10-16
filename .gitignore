@@ -3,5 +3,10 @@
 
 # (おまけ) データベースファイルやキャッシュも除外しておくと良いです
 *.db
+*.db-wal
+*.db-shm
+*.lock
+logs/
+backups/
 __pycache__/
 *.pyc

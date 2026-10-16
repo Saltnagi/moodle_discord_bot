@@ -21,8 +21,10 @@ def _parse_hosts(raw) -> list:
 # ここに無いサイトのURLは、登録も取得もできない（SSRF対策）。
 MOODLE_ALLOWED_HOSTS = frozenset(_parse_hosts(os.environ.get("MOODLE_ALLOWED_HOSTS")))
 
-# 起動時のカレントディレクトリに依存しないよう、このファイルの隣にDBを置く
-DB_FILE = str(Path(__file__).parent / "moodle_bot.db")
+# データ置き場（DB / logs / backups / lock の置き場）
+DATA_DIR = os.environ.get("DATA_DIR", ".")
+DB_FILE = os.path.join(DATA_DIR, "moodle_bot.db")
+LOCK_FILE = os.path.join(DATA_DIR, "moodle_bot.lock")
 
 # 初回起動時（新規ユーザーのURL登録時）に登録されるフィルターキーワード
 DEFAULT_FILTER_WORDS = ["期限", "試験"]
@@ -38,6 +40,8 @@ DM_RETRY_HOURS = 120
 
 # Moodleへのリクエストのタイムアウト（秒）
 REQUEST_TIMEOUT = 10
+FETCH_TOTAL_TIMEOUT_SEC = 20  # 全体のタイムアウト（秒）
+MAX_ICS_BYTES = 5 * 1024 * 1024  # 取得するICSファイルの最大サイズ（5MB）
 
 # --- 入力・通信の上限（悪用や誤入力の対策） ---
 MAX_WORD_LENGTH = 50  # フィルター／除外ワード1つあたりの最大文字数
@@ -51,11 +55,27 @@ DEFAULT_NOTIFY_TIMES = ["08:30", "18:00"]
 # 1人が登録できる定刻の数
 MAX_NOTIFY_TIMES = 4
 # 定刻を過ぎても、この時間内なら送る（再起動やMoodle障害からの復帰用）
-DIGEST_GRACE_MINUTES = 30
+DIGEST_GRACE_MINUTES = 60
 # 定刻通知の取得・送信に失敗したときの再試行間隔（分）
 DIGEST_RETRY_MINUTES = 5
 # 定刻通知に載せる予定の範囲（今後何日分か）。ユーザーの !期間 設定がこれより短ければそちらを優先
 DIGEST_MAX_DAYS = 7
+
+# --- ヘルスチェック・通知監視 ---
+HEALTH_INVALID_AFTER_MIN = 180        # INVALID が継続したら案内（分）
+HEALTH_ANY_AFTER_HOURS = 24           # 種別を問わず継続したら案内（時間）
+HEALTH_PROBE_INTERVAL_MIN = 360       # 案内後の再試行間隔（分）
+
+# --- 並行制御・運用 ---
+FETCH_CONCURRENCY = 5
+RETENTION_DAYS = 30
+BACKUP_KEEP = 7
+ADMIN_USER_ID = int(os.environ["ADMIN_USER_ID"]) if os.environ.get("ADMIN_USER_ID") else None
+
+# --- シラバス連携 ---
+SYLLABUS_CA_BUNDLE = os.environ.get("SYLLABUS_CA_BUNDLE")  # 任意
+SYLLABUS_PARSE_FAIL_THRESHOLD = 5
+ADMIN_ALERT_COOLDOWN_HOURS = 24
 
 # Botのステータス欄に常時表示するメッセージ
 STATUS_MESSAGE = "/使い方 で使い方を表示"

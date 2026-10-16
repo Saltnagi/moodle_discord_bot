@@ -1,6 +1,6 @@
-# Moodleサーバとの通信、.icsファイルの解析
 import datetime
 import logging
+import time
 import unicodedata
 from dataclasses import dataclass
 from typing import Optional
@@ -11,11 +11,14 @@ import requests
 from icalendar import Calendar
 
 from config import (
+    FETCH_TOTAL_TIMEOUT_SEC,
+    MAX_ICS_BYTES,
     MAX_REDIRECTS,
     MAX_URL_LENGTH,
     MOODLE_ALLOWED_HOSTS,
     REQUEST_TIMEOUT,
 )
+from errors import FailureKind, MoodleError
 from syllabus import CourseNameResolver, parse_course_key
 
 log = logging.getLogger(__name__)
@@ -192,13 +195,6 @@ def normalize_text(text: str) -> str:
     （例: "Report" / "report" / "ＲＥＰＯＲＴ" はすべて同じ扱い）"""
     return unicodedata.normalize("NFKC", text).casefold()
 
-
-class MoodleError(Exception):
-    """取得・解析の失敗。メッセージはユーザーに見せても安全な固定文のみ。
-
-    MoodleのカレンダーURLには認証トークンが含まれるため、
-    requestsの例外メッセージ（URL入り）をそのまま表示してはいけない。
-    """
 
 
 @dataclass(frozen=True)
@@ -385,31 +381,151 @@ def check_url(url) -> Optional[str]:
 _REDIRECT_CODES = (301, 302, 303, 307, 308)
 
 
-def _http_get(ics_url: str):
-    """URLを取得する。リダイレクトは自分で追い、移動先も毎回 check_url で検査する。"""
-    url = ics_url
+def fetch_ics_limited(
+    url: str,
+    *,
+    max_bytes: int = MAX_ICS_BYTES,
+    total_timeout: float = FETCH_TOTAL_TIMEOUT_SEC,
+) -> bytes:
+    """
+    - 既存の check_url / リダイレクト再検証（最大3回）を維持
+    - requests.get(..., stream=True)
+    - Content-Length が max_bytes 超なら読まずに中断
+    - iter_content(8192) で累積サイズを監視し、超過で中断
+    - 開始からの経過が total_timeout 超なら中断（遅延送信対策。read timeoutとは別に全体で見る）
+    - HTTP 401/403/404/410 → MoodleError(kind=INVALID)
+    - 5xx/429/timeout/接続失敗/サイズ超過 → MoodleError(kind=TRANSIENT)
+    - 本文の先頭が b"BEGIN:VCALENDAR" でない → MoodleError(kind=INVALID)
+    - 例外メッセージ・ログにURL（トークン）を含めない（既存のマスキング方針を踏襲）
+    """
+    start_time = time.monotonic()
+    current_url = url
+
     for _ in range(MAX_REDIRECTS + 1):
-        if check_url(url) is not None:
-            # URL自体（認証トークン入り）はログにも出さない
+        if check_url(current_url) is not None:
             log.warning("許可されていないURLへのアクセスをブロックしました")
             raise MoodleError(
                 "登録されているURLは許可されていません。"
-                "`/url 登録` で、大学のMoodleのカレンダーURLを登録し直してください。"
+                "`/url 登録` で、大学のMoodleのカレンダーURLを登録し直してください。",
+                FailureKind.INVALID,
             )
+
+        elapsed = time.monotonic() - start_time
+        remaining_time = total_timeout - elapsed
+        if remaining_time <= 0:
+            log.warning("Moodle通信全体タイムアウト")
+            raise MoodleError("Moodleからのデータ取得がタイムアウトしました。", FailureKind.TRANSIENT)
+
+        request_timeout = min(float(REQUEST_TIMEOUT), remaining_time)
+
         try:
-            response = requests.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=False)
+            response = requests.get(
+                current_url,
+                timeout=request_timeout,
+                stream=True,
+                allow_redirects=False,
+            )
+        except requests.Timeout:
+            log.warning("Moodle通信タイムアウト")
+            raise MoodleError(
+                "Moodleへの接続がタイムアウトしました。時間をおいて再度お試しください。",
+                FailureKind.TRANSIENT,
+            ) from None
         except requests.RequestException as e:
-            # 例外メッセージにURLが入るため、型名だけをログに残す
             log.warning("Moodle通信エラー: %s", type(e).__name__)
             raise MoodleError(
-                "Moodleに接続できませんでした。時間をおいて再度お試しください。"
+                "Moodleに接続できませんでした。時間をおいて再度お試しください。",
+                FailureKind.TRANSIENT,
             ) from None
+
         if response.status_code in _REDIRECT_CODES and response.headers.get("Location"):
-            url = urljoin(url, response.headers["Location"])
+            response.close()
+            current_url = urljoin(current_url, response.headers["Location"])
             continue
-        return response
+
+        status = response.status_code
+        if status in (401, 403, 404, 410):
+            response.close()
+            log.warning("Moodleが HTTP %s を返しました (無効なURL/トークン)", status)
+            raise MoodleError(
+                f"カレンダーURLが無効か、アクセス権がありません (HTTP {status})。"
+                "`/url 登録` で再登録してください。",
+                FailureKind.INVALID,
+            )
+        elif status == 429 or 500 <= status <= 599:
+            response.close()
+            log.warning("Moodleが HTTP %s を返しました (一時的エラー)", status)
+            raise MoodleError(
+                f"Moodleサーバーで一時的なエラーが発生しました (HTTP {status})。",
+                FailureKind.TRANSIENT,
+            )
+        elif status != 200:
+            response.close()
+            log.warning("Moodleが HTTP %s を返しました", status)
+            raise MoodleError(
+                f"Moodleからのデータ取得に失敗しました (HTTP {status})。",
+                FailureKind.TRANSIENT,
+            )
+
+        cl_header = response.headers.get("Content-Length")
+        if cl_header:
+            try:
+                cl_val = int(cl_header)
+                if cl_val > max_bytes:
+                    response.close()
+                    log.warning("Content-Length が上限を超過: %d > %d", cl_val, max_bytes)
+                    raise MoodleError(
+                        "カレンダーデータのサイズが上限（5MB）を超えています。",
+                        FailureKind.TRANSIENT,
+                    )
+            except ValueError:
+                pass
+
+        chunks = []
+        total_downloaded = 0
+        try:
+            for chunk in response.iter_content(chunk_size=8192):
+                if time.monotonic() - start_time > total_timeout:
+                    response.close()
+                    log.warning("Moodle通信全体タイムアウト（受信中）")
+                    raise MoodleError("Moodleからのデータ取得がタイムアウトしました。", FailureKind.TRANSIENT)
+
+                if chunk:
+                    total_downloaded += len(chunk)
+                    if total_downloaded > max_bytes:
+                        response.close()
+                        log.warning("受信サイズが上限を超過: %d > %d", total_downloaded, max_bytes)
+                        raise MoodleError(
+                            "カレンダーデータのサイズが上限（5MB）を超えています。",
+                            FailureKind.TRANSIENT,
+                        )
+                    chunks.append(chunk)
+        except requests.RequestException as e:
+            response.close()
+            log.warning("Moodleデータ受信中エラー: %s", type(e).__name__)
+            raise MoodleError(
+                "Moodleからのデータ受信中に通信エラーが発生しました。",
+                FailureKind.TRANSIENT,
+            ) from None
+        finally:
+            response.close()
+
+        content = b"".join(chunks)
+
+        if b"BEGIN:VCALENDAR" not in content[:4096].upper():
+            log.warning("Moodleの応答がICS形式ではありません（メンテナンス中またはログイン画面の可能性）")
+            raise MoodleError(
+                "Moodleからカレンダーデータを受け取れませんでした（メンテナンス中等の可能性があります）。",
+                FailureKind.INVALID,
+            )
+
+        return content
+
     log.warning("リダイレクトが多すぎるため中断しました")
-    raise MoodleError("Moodleとの通信でリダイレクトが繰り返されました。URLを確認してください。")
+    raise MoodleError(
+        "Moodleとの通信でリダイレクトが繰り返されました。URLを確認してください。",
+        FailureKind.INVALID,
+    )
 
 
 def fetch_events(
@@ -433,28 +549,13 @@ def fetch_events(
     """
     now = now or datetime.datetime.now(JST)
 
-    response = _http_get(ics_url)
-
-    if response.status_code != 200:
-        log.warning("Moodleが HTTP %s を返しました", response.status_code)
-        raise MoodleError(
-            f"Moodleからのデータ取得に失敗しました (HTTP {response.status_code})。"
-            "カレンダーURLが正しいか確認してください。"
-        )
-
-    # メンテナンス画面やログイン画面が HTTP 200 のHTMLで返ってくることがある。
-    # それを「予定0件」と誤認しないよう、ICSかどうかを先に確認する。
-    if b"BEGIN:VCALENDAR" not in response.content[:4096].upper():
-        log.warning("Moodleの応答がICS形式ではありません（メンテナンス中の可能性）")
-        raise MoodleError(
-            "Moodleから予定データを受け取れませんでした（メンテナンス中の可能性があります）。"
-        )
+    content = fetch_ics_limited(ics_url)
 
     try:
-        cal = Calendar.from_ical(response.content)
+        cal = Calendar.from_ical(content)
     except Exception as e:
         log.warning("ICSの解析に失敗: %s", type(e).__name__)
-        raise MoodleError("カレンダーデータの解析に失敗しました。") from None
+        raise MoodleError("カレンダーデータの解析に失敗しました。", FailureKind.INVALID) from None
 
     norm_words = [w for w in (normalize_text(w) for w in filter_words) if w]
     norm_excludes = [w for w in (normalize_text(w) for w in (exclude_words or [])) if w]

@@ -20,13 +20,25 @@ _USER_TABLES = (
     "reminded",
     "dm_blocked",
     "digest_sent",
+    "user_health",
 )
+
+
+def get_connection() -> sqlite3.Connection:
+    """全DB操作はこの関数経由に統一。
+    - PRAGMA busy_timeout = 5000
+    - PRAGMA foreign_keys = ON
+    """
+    conn = sqlite3.connect(DB_FILE, timeout=5.0)
+    conn.execute("PRAGMA busy_timeout = 5000;")
+    conn.execute("PRAGMA foreign_keys = ON;")
+    return conn
 
 
 @contextmanager
 def _connect():
     """接続を開き、正常終了ならcommit、最後に必ずcloseする"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_connection()
     try:
         yield conn
         conn.commit()
@@ -141,6 +153,18 @@ def init_db() -> dict:
                 PRIMARY KEY (year, code)
             )
         """)
+        # ユーザーのヘルスチェック状態（連続失敗・失効検知）
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_health (
+                user_id          INTEGER PRIMARY KEY,
+                first_failure_at TEXT,
+                last_failure_at  TEXT,
+                last_kind        TEXT,
+                notified_at      TEXT
+            )
+        """)
+
+        conn.execute("PRAGMA journal_mode = WAL;")
 
         _migrate_global_filters(conn)
 
@@ -431,4 +455,46 @@ def save_course_name(year: int, code: str, name: Optional[str]) -> None:
         conn.execute(
             "INSERT OR REPLACE INTO courses (year, code, name, fetched_at) VALUES (?, ?, ?, ?)",
             (year, code, name, now_str),
-        )
+        )
+
+
+# --- ユーザーヘルス状態操作 ---
+def get_user_health(user_id: int) -> Optional[dict]:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT first_failure_at, last_failure_at, last_kind, notified_at FROM user_health WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "user_id": user_id,
+        "first_failure_at": row[0],
+        "last_failure_at": row[1],
+        "last_kind": row[2],
+        "notified_at": row[3],
+    }
+
+
+def save_user_health(
+    user_id: int,
+    first_failure_at: str,
+    last_failure_at: str,
+    last_kind: str,
+    notified_at: Optional[str],
+) -> None:
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO user_health
+                (user_id, first_failure_at, last_failure_at, last_kind, notified_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (user_id, first_failure_at, last_failure_at, last_kind, notified_at),
+        )
+
+
+def delete_user_health(user_id: int) -> None:
+    with _connect() as conn:
+        conn.execute("DELETE FROM user_health WHERE user_id = ?", (user_id,))
+
