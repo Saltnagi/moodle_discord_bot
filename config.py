@@ -55,7 +55,15 @@ DIGEST_RETRY_MINUTES = 5
 DIGEST_MAX_DAYS = 7
 
 # Botのステータス欄に常時表示するメッセージ
-STATUS_MESSAGE = "!help で使い方を表示"
+STATUS_MESSAGE = "/使い方 で使い方を表示"
+
+# --- スラッシュコマンド ---
+# コマンドの名前・説明・引数を変更したら、この値を書き換える。
+# 起動時に、前回と値が違えばDiscordへコマンドを再登録（同期）する。
+# （毎回の起動で同期するとDiscordのレート制限に当たるため、変更時だけ行う）
+COMMANDS_VERSION = "2026-10-slash-1"
+# .env に SYNC_COMMANDS=1 を書くと、値に関わらず、起動時に必ず同期する
+SYNC_COMMANDS = os.environ.get("SYNC_COMMANDS", "").strip().lower() in ("1", "true", "yes")
 
 
 def require_token() -> str:

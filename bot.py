@@ -6,24 +6,28 @@ import sys
 import traceback
 import unicodedata
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 import discord
-from discord.ext import commands, tasks
+from discord import app_commands
+from discord.ext import tasks
 
 import database
 import moodle
 from config import (
     CHECK_INTERVAL_MINUTES,
+    COMMANDS_VERSION,
     DIGEST_GRACE_MINUTES,
     DIGEST_MAX_DAYS,
     DIGEST_RETRY_MINUTES,
     DM_RETRY_HOURS,
     MAX_NOTIFY_TIMES,
+    MAX_URL_LENGTH,
     MAX_WORD_LENGTH,
     MAX_WORDS_PER_LIST,
     REMINDER_BEFORE_MINUTES,
     STATUS_MESSAGE,
+    SYNC_COMMANDS,
     require_allowed_hosts,
     require_token,
 )
@@ -43,57 +47,75 @@ for _uid, _url in user_urls.items():
     if moodle.check_url(_url) is not None:
         log.warning(
             "ユーザー %s の登録URLは許可されていない（https以外、または許可ドメイン外）ため、"
-            "通知されません。本人に `!url 登録` のやり直しを案内してください。",
+            "通知されません。本人に `/url 登録` のやり直しを案内してください。",
             _uid,
         )
-
-intents = discord.Intents.default()
-intents.message_content = True
-# - 標準の help コマンドは使わず、下の「!使い方 / !help」を自前で用意する
-# - allowed_mentions=none: Botの発言に含まれる @everyone や @ユーザー で、実際に通知が飛ばないようにする
-#   （ユーザーが入力した単語をそのままBotが返信に含めるため、メンション悪用の対策）
-bot = commands.Bot(
-    command_prefix="!",
-    intents=intents,
-    help_command=None,
-    allowed_mentions=discord.AllowedMentions.none(),
-)
 
 # 定刻通知の取得・送信に失敗したユーザーの、次に再試行してよい時刻（メモリ上のみ）
 _digest_retry_at: dict = {}
 
-GUIDE_TEXT = (
-    "**【Moodle通知Botの使い方】**\n"
-    "1. Moodleの「カレンダーをエクスポート」からURLを取得します。\n"
-    "2. `!url 登録 <あなたのURL>` を送信して登録します。\n"
-    "3. `!フィルター 追加 <キーワード>` で、通知してほしい授業名や「課題」「小テスト」などの単語を登録します。\n"
-    "※以後は自動で予定をお知らせします！手動で確認したい時は `!moodle` と送信してください。\n"
-    "\n"
-    "**【その他のコマンド】**\n"
-    "・`!除外 追加 <キーワード>` … 通知したくない単語を登録します（フィルターより優先）\n"
-    "・`!通知時間 設定 8:30 18:00` … 毎日の定刻通知の時刻を変更します（`!通知時間` で確認、`オフ` で停止）\n"
-    "・`!期間 7` … 通知する予定を今後7日以内に絞ります（`!期間 解除` で解除）\n"
-    "・`!フィルター` / `!除外` … 現在の設定を表示します\n"
-    "※URLの登録・確認は、このBotとのDMで行ってください。"
-)
 
+# --------------------------------------------------
+# 説明文（/使い方 と、初めてのDMで使う）
+# --------------------------------------------------
+# URL未登録のユーザーには「URLの登録」だけを案内し、登録できたら他のコマンドを案内する
 URL_GUIDE_TEXT = (
-    "**【MoodleのカレンダーURLの取得方法】**\n"
+    "**【Moodle通知Botの使い方】**\n"
+    "まずは、MoodleのカレンダーURLを登録しましょう。\n"
+    "\n"
+    "**① カレンダーURLを取得する**\n"
     "1. CNSのいずれかの授業から「e-ラーニング」を選び、Moodleへ移動します。\n"
     "2. 右上のアイコンから「カレンダー」を選択します。\n"
     "3. ページ下部にある「カレンダーをインポートまたはエクスポートする」を選択します。\n"
     "4. そのページの「カレンダーをエクスポートする」を選択します。\n"
     "5. 「エクスポートするイベント」は「すべてのイベント」、「期間」は「最近及び次の60日間」を選択します。\n"
-    "6. その状態で「カレンダーURLを取得する」を選択し、出てきたURLを "
-    "`!url 登録 <URL>` の形で、このBotとのDMに送信します。\n"
+    "6. その状態で「カレンダーURLを取得する」を選択し、表示されたURLをコピーします。\n"
+    "\n"
+    "**② Botに登録する**\n"
+    "`/url 登録` を実行し、開いた入力欄にURLを貼り付けて送信します。\n"
     "\n"
     "⚠️ このURLは**あなた専用の鍵**です。知られると、あなたの予定を他の人に見られてしまいます。"
-    "サーバーのチャンネルには貼らず、必ずこのBotとのDMで送ってください。\n"
-    "※登録できるのは、大学のMoodleのURL（https://〜）のみです。"
+    "他の人には見せないでください。\n"
+    "※登録できるのは、大学のMoodleのURL（https://〜）のみです。\n"
+    "※登録が終わると、使えるコマンドの説明が表示されます。"
 )
 
-# 最初のDMと !使い方 で、この順に送る
-GUIDE_MESSAGES = (GUIDE_TEXT, URL_GUIDE_TEXT)
+# URL登録済みのユーザーには、URL登録以外のコマンドを案内する
+COMMANDS_GUIDE_TEXT = (
+    "**【Moodle通知Botの使い方】**\n"
+    "登録できました！以後は、新しい予定などを自動でお知らせします。\n"
+    "手動で確認したいときは `/moodle` を実行してください。\n"
+    "\n"
+    "**コマンド一覧**\n"
+    "・`/moodle` … 今後の予定を今すぐ確認します\n"
+    "・`/フィルター 追加 <単語>` … 通知してほしい授業名や「課題」「小テスト」などの単語を登録します"
+    "（`/フィルター 一覧` で確認、`/フィルター 削除` で削除）\n"
+    "・`/除外 追加 <単語>` … 通知したくない単語を登録します（フィルターより優先されます）\n"
+    "・`/期間 設定 <日数>` … 通知する予定を、今後◯日以内に絞ります（`/期間 解除` で解除）\n"
+    "・`/通知時間 設定 <時刻>` … 毎日の定刻通知の時刻を変更します"
+    "（初期設定は 8:30 と 18:00。`/通知時間 オフ` で停止）\n"
+    "\n"
+    "**届く通知**\n"
+    "・新しい予定が見つかったとき\n"
+    "・提出期限の1時間前\n"
+    "・毎日の定刻通知（今後1週間の予定のまとめ）\n"
+    "※時刻はすべて日本時間です。"
+)
+
+NEED_REGISTER_TEXT = (
+    "先に `/url 登録` で、MoodleのカレンダーURLを登録してください。\n"
+    "取得方法は `/使い方` で確認できます。"
+)
+
+LEGACY_TEXT = (
+    "コマンドの入力方法が変わりました。「!」ではなく、「/」を入力すると、"
+    "使えるコマンドの候補が表示されます。\n例: `/使い方`　`/moodle`"
+)
+
+
+def help_texts(user_id: int) -> list:
+    """URL未登録ならURL登録の説明のみ、登録済みならそれ以外のコマンドの説明のみ"""
+    return [COMMANDS_GUIDE_TEXT] if user_id in user_urls else [URL_GUIDE_TEXT]
 
 
 # --------------------------------------------------
@@ -143,15 +165,6 @@ def parse_hhmm(text: str) -> Optional[str]:
     if hour > 23 or minute > 59:
         return None
     return f"{hour:02d}:{minute:02d}"
-
-
-def parse_days(text: str) -> Optional[int]:
-    """'7' '7日' '７' などを日数(1〜365)に直す。不正ならNone"""
-    m = re.fullmatch(r"(\d{1,3})日?", unicodedata.normalize("NFKC", text).strip())
-    if not m:
-        return None
-    days = int(m.group(1))
-    return days if 1 <= days <= 365 else None
 
 
 def validate_word(word: str) -> Optional[str]:
@@ -239,6 +252,340 @@ def format_with_remaining(ev: moodle.MoodleEvent, now: datetime.datetime) -> str
     return f"{ev.format()}（あと{minutes}分）"
 
 
+def install_links(app_id: int) -> dict:
+    """Botを導入するためのリンク。
+    user : 自分のアカウントに追加する（ユーザーインストール。サーバーは不要）
+    guild: サーバーに追加する
+    """
+    base = f"https://discord.com/oauth2/authorize?client_id={app_id}"
+    return {
+        "user": f"{base}&integration_type=1&scope=applications.commands",
+        "guild": f"{base}&integration_type=0&scope=bot+applications.commands",
+    }
+
+
+# --------------------------------------------------
+# Discordのクライアント本体
+# --------------------------------------------------
+class MoodleBot(discord.Client):
+    def __init__(self):
+        # - メッセージ内容の権限（特権インテント）は不要。スラッシュコマンドを使うため。
+        # - allowed_mentions=none: Botの発言に含まれる @everyone などで、実際に通知が飛ばないようにする
+        super().__init__(
+            intents=discord.Intents.default(),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        self.tree = app_commands.CommandTree(self)
+
+    async def setup_hook(self):
+        # コマンドの変更があったときだけ、Discordへ再登録（同期）する
+        stored = database.get_meta("commands_version")
+        if SYNC_COMMANDS or stored != COMMANDS_VERSION:
+            synced = await self.tree.sync()
+            database.set_meta("commands_version", COMMANDS_VERSION)
+            log.info("スラッシュコマンドをDiscordに同期しました（%d件）", len(synced))
+        else:
+            log.info("スラッシュコマンドは同期済みです（バージョン %s）", COMMANDS_VERSION)
+
+        # 導入リンクをターミナルに表示する
+        if self.application_id:
+            links = install_links(self.application_id)
+            print("【導入リンク】")
+            print(f"  自分のアカウントに追加（サーバー不要）: {links['user']}")
+            print(f"  サーバーに追加                        : {links['guild']}")
+
+
+bot = MoodleBot()
+tree = bot.tree
+
+
+def everywhere(obj):
+    """コマンドを、次のすべてで使えるようにする。
+    ・導入方法: サーバーへの導入 / ユーザーインストール（自分のアカウントへの追加）
+    ・使う場所: サーバー / Botとの個人DM / 他の人とのDM・グループDM
+    """
+    app_commands.allowed_installs(guilds=True, users=True)(obj)
+    app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)(obj)
+    return obj
+
+
+# --------------------------------------------------
+# 返信の共通処理
+# --------------------------------------------------
+def use_ephemeral(interaction) -> bool:
+    """返信を「自分にだけ見える形」にするか。
+
+    Botとの1対1のDMでは、通常のメッセージとして残す。
+    サーバーや他の人とのDMでは、予定の内容が他の人に見えないよう、自分にだけ見える形にする。
+    判別できないときは、安全のため「自分にだけ見える形」にする。
+    """
+    ctx = getattr(interaction, "context", None)
+    if ctx is not None and getattr(ctx, "dm_channel", False):
+        return False
+    return True
+
+
+async def send(interaction, text: str):
+    ephemeral = use_ephemeral(interaction)
+    if interaction.response.is_done():
+        await interaction.followup.send(text, ephemeral=ephemeral)
+    else:
+        await interaction.response.send_message(text, ephemeral=ephemeral)
+
+
+async def send_all(interaction, texts: list):
+    for text in texts:
+        await send(interaction, text)
+
+
+# --------------------------------------------------
+# コマンドの中身（Discordに依存しない部分。文章を返す）
+# --------------------------------------------------
+def _guard(user_id: int) -> Optional[str]:
+    return None if user_id in user_urls else NEED_REGISTER_TEXT
+
+
+# ---- URL ----
+def register_url(user_id: int, url: str) -> tuple:
+    """URLを検査して登録する。戻り値: (成功したか, 返信文, 新規ユーザーか)"""
+    url = (url or "").strip()
+    problem = moodle.check_url(url)
+    if problem:
+        # 入力されたURL（認証トークン入り）は返信に含めない
+        return False, f"❌ {problem}\n取得方法は `/使い方` で確認できます。", False
+    user_urls[user_id] = url
+    is_new = database.save_user_url(user_id, url)
+    database.clear_dm_block(user_id)  # 本人が操作してきたので、DM拒否中の記録は解除する
+    message = (
+        "✅ MoodleのカレンダーURLを登録しました！"
+        if is_new
+        else "✅ MoodleのカレンダーURLを更新しました！"
+    )
+    return True, message, is_new
+
+
+def url_status_text(user_id: int) -> str:
+    if user_id in user_urls:
+        return "✅ MoodleのカレンダーURLは登録済みです。\n更新する場合は `/url 登録` を実行してください。"
+    return "❌ URLが登録されていません。\n`/url 登録` で登録してください。取得方法は `/使い方` で確認できます。"
+
+
+def url_delete_text(user_id: int) -> str:
+    if user_id not in user_urls:
+        return "登録されているURLはありません。"
+    del user_urls[user_id]
+    database.delete_user_url(user_id)  # フィルター・設定・通知履歴なども削除される
+    return "🗑️ 登録されていたURLと各種設定を削除しました。"
+
+
+# ---- フィルター／除外ワード ----
+@dataclass(frozen=True)
+class WordKind:
+    cmd: str
+    header: str
+    mark: str
+    empty_text: str
+    notes: str
+    get: Callable
+    add: Callable
+    delete: Callable
+    added: str
+    removed: str
+
+
+FILTER_KIND = WordKind(
+    cmd="フィルター",
+    header="**【あなたの通知フィルター設定】**",
+    mark="✅",
+    empty_text=(
+        "現在、フィルターは未設定です。**すべての予定**が通知・表示されます。\n"
+        "※絞り込む場合: `/フィルター 追加 <単語>`"
+    ),
+    notes="\n※すべて削除すると、全予定が通知されます",
+    get=database.get_filter_words,
+    add=database.add_filter_word,
+    delete=database.delete_filter_word,
+    added="フィルターに「**{word}**」を追加しました！✅",
+    removed="フィルターから「**{word}**」を削除しました。❌",
+)
+
+EXCLUDE_KIND = WordKind(
+    cmd="除外",
+    header="**【あなたの除外ワード設定】**",
+    mark="🚫",
+    empty_text=(
+        "現在、除外ワードは設定されていません。\n"
+        "※追加する場合: `/除外 追加 <単語>`"
+    ),
+    notes="\n※除外ワードを含む予定は、フィルターに一致しても通知されません",
+    get=database.get_exclude_words,
+    add=database.add_exclude_word,
+    delete=database.delete_exclude_word,
+    added="除外ワードに「**{word}**」を追加しました！🚫",
+    removed="除外ワードから「**{word}**」を削除しました。",
+)
+
+
+def words_list_text(kind: WordKind, user_id: int) -> str:
+    guard = _guard(user_id)
+    if guard:
+        return guard
+    words = kind.get(user_id)
+    if not words:
+        return kind.empty_text
+    msg = kind.header + "\n" + "".join(f"・{w}：{kind.mark}\n" for w in words)
+    msg += "\n※大文字小文字・全角半角は区別しません"
+    msg += f"\n※追加: `/{kind.cmd} 追加 <単語>`　削除: `/{kind.cmd} 削除 <単語>`"
+    msg += kind.notes
+    return msg
+
+
+def add_word_text(kind: WordKind, user_id: int, word: str) -> str:
+    guard = _guard(user_id)
+    if guard:
+        return guard
+    word = (word or "").strip()
+    problem = validate_word(word)
+    if problem:
+        return f"❌ {problem}"
+    words = kind.get(user_id)
+    # 大文字小文字・全角半角の違いだけの重複は登録しない
+    if any(moodle.normalize_text(w) == moodle.normalize_text(word) for w in words):
+        return f"「{word}」は既に登録されています。"
+    if len(words) >= MAX_WORDS_PER_LIST:
+        return (
+            f"❌ 登録できるのは最大{MAX_WORDS_PER_LIST}個までです。"
+            f"不要なものを `/{kind.cmd} 削除` で削除してから追加してください。"
+        )
+    kind.add(user_id, word)
+    return kind.added.format(word=word)
+
+
+def delete_word_text(kind: WordKind, user_id: int, word: str) -> str:
+    guard = _guard(user_id)
+    if guard:
+        return guard
+    word = (word or "").strip()
+    # 登録時の表記と大文字小文字が違っていても削除できる
+    target = next(
+        (w for w in kind.get(user_id) if moodle.normalize_text(w) == moodle.normalize_text(word)),
+        None,
+    )
+    if target is None:
+        return f"「{short(word)}」は登録されていません。"
+    kind.delete(user_id, target)
+    return kind.removed.format(word=target)
+
+
+def word_choices(kind: WordKind, user_id: int, current: str) -> list:
+    """削除コマンドの入力候補（登録済みの単語のうち、入力途中の文字を含むもの）"""
+    needle = moodle.normalize_text(current or "")
+    words = [w for w in kind.get(user_id) if needle in moodle.normalize_text(w)]
+    return words[:25]  # Discordの候補は最大25個
+
+
+# ---- 毎日の通知時刻 ----
+def notify_time_text(user_id: int) -> str:
+    guard = _guard(user_id)
+    if guard:
+        return guard
+    current = database.get_notify_times(user_id)
+    period = database.get_period_days(user_id)
+    days = min(period, DIGEST_MAX_DAYS) if period else DIGEST_MAX_DAYS
+    if current:
+        head = (
+            f"**【定刻通知の設定】**\n毎日 {' / '.join(current)} に、"
+            f"今後{days}日間の予定一覧をお知らせします。\n"
+        )
+    else:
+        head = "**【定刻通知の設定】**\n現在、定刻通知は**オフ**です。\n"
+    return (
+        head
+        + f"\n※変更: `/通知時間 設定`（最大{MAX_NOTIFY_TIMES}つ。例: 8:30 18:00）"
+        + "\n※停止: `/通知時間 オフ`　初期設定に戻す: `/通知時間 初期化`"
+        + "\n※時刻は日本時間です。対象の予定が1件もない時は送信されません。"
+    )
+
+
+def set_notify_times_text(user_id: int, raw: str) -> str:
+    guard = _guard(user_id)
+    if guard:
+        return guard
+    text = unicodedata.normalize("NFKC", raw or "").strip()
+    tokens = [t for t in re.split(r"[\s,、，]+", text) if t]
+    parsed = [parse_hhmm(t) for t in tokens]
+    if not tokens or None in parsed:
+        return (
+            "時刻は `8:30` のように指定してください（0:00〜23:59）。\n"
+            "複数ならスペースで区切ります。例: `8:30 18:00`"
+        )
+    unique = sorted(set(parsed))
+    if len(unique) > MAX_NOTIFY_TIMES:
+        return f"登録できる時刻は最大{MAX_NOTIFY_TIMES}つまでです。"
+    database.set_notify_times(user_id, unique)
+    return f"定刻通知を毎日 {' / '.join(unique)} に設定しました！⏰"
+
+
+def notify_time_off_text(user_id: int) -> str:
+    guard = _guard(user_id)
+    if guard:
+        return guard
+    database.set_notify_times(user_id, [])
+    return "定刻通知をオフにしました。再開は `/通知時間 初期化` または `/通知時間 設定` です。"
+
+
+def notify_time_reset_text(user_id: int) -> str:
+    guard = _guard(user_id)
+    if guard:
+        return guard
+    database.set_notify_times(user_id, None)
+    return f"定刻通知を初期設定（毎日 {' / '.join(database.get_notify_times(user_id))}）に戻しました。"
+
+
+# ---- 通知する期間 ----
+_PERIOD_NOTE = (
+    "\n※期間を広げても、カレンダーURLを発行したときの期間（Moodleのエクスポート範囲）"
+    "より先の予定は取得できません。"
+)
+
+
+def period_text(user_id: int) -> str:
+    guard = _guard(user_id)
+    if guard:
+        return guard
+    days = database.get_period_days(user_id)
+    if days:
+        return (
+            f"通知する予定の期間: **今後{days}日以内**\n"
+            "※変更: `/期間 設定`　解除: `/期間 解除`" + _PERIOD_NOTE
+        )
+    return (
+        "通知する予定の期間: **制限なし**（カレンダーにある今後の予定すべて）\n"
+        "※絞り込む場合: `/期間 設定`（例: 7日）" + _PERIOD_NOTE
+    )
+
+
+def set_period_text(user_id: int, days) -> str:
+    guard = _guard(user_id)
+    if guard:
+        return guard
+    if not isinstance(days, int) or isinstance(days, bool) or not 1 <= days <= 365:
+        return "日数は1〜365の数字で指定してください。\n例: 7"
+    database.set_period_days(user_id, days)
+    return f"通知する予定を**今後{days}日以内**に絞りました！📆" + _PERIOD_NOTE
+
+
+def clear_period_text(user_id: int) -> str:
+    guard = _guard(user_id)
+    if guard:
+        return guard
+    database.set_period_days(user_id, None)
+    return "期間の制限を解除しました。"
+
+
+# --------------------------------------------------
+# DM通知の送信
+# --------------------------------------------------
 async def deliver(user_id: int, header: str, lines: list, now: datetime.datetime) -> bool:
     """ユーザーにDMで通知する。成功したらTrue。
 
@@ -264,21 +611,22 @@ async def deliver(user_id: int, header: str, lines: list, now: datetime.datetime
     return True
 
 
-async def reply_dm(ctx, text: str) -> bool:
-    """コマンドを送った本人のDMにだけ返信する。
-
-    DMを送れなかった場合は、その旨だけをチャンネルに出してFalseを返す
-    （予定の内容はチャンネルに出さない）。
-    """
+async def verify_dm(interaction):
+    """URL登録のとき、BotからこのユーザーへDMを送れるかを確認する（通知はDMで届くため）"""
+    ctx = getattr(interaction, "context", None)
+    if ctx is not None and getattr(ctx, "dm_channel", False):
+        return  # Botとの個人DMで操作中なら、DMは届くと分かっている
     try:
-        await ctx.author.send(text)
-        return True
+        await interaction.user.send("✅ 通知の受信テストです。今後の通知は、このDMに届きます。")
     except discord.Forbidden:
-        await ctx.send(
-            f"{ctx.author.mention} DMを送信できませんでした。"
-            "DMの受信設定（サーバーメンバーからのDMを許可）を確認してください。"
+        await send(
+            interaction,
+            "⚠️ BotからあなたへDMを送れませんでした。通知はDMで届くため、"
+            "DMの受信設定（サーバーメンバーからのDMを許可する、など）を確認してから、"
+            "もう一度 `/url 登録` を実行してください。",
         )
-        return False
+    except Exception as e:
+        log.warning("登録時のDM確認に失敗: %s", redact(str(e)))
 
 
 # --------------------------------------------------
@@ -442,7 +790,7 @@ async def scheduled_digest():
 @bot.event
 async def on_ready():
     print(f"Botが開通しました: {bot.user.name}")
-    # Botのステータス欄に「!help で使い方を表示」を常時表示する
+    # Botのステータス欄に「/使い方 で使い方を表示」を常時表示する
     await bot.change_presence(activity=discord.Game(name=STATUS_MESSAGE))
     # Bot起動時に定期タスクを開始
     if not auto_check_moodle.is_running():
@@ -453,399 +801,245 @@ async def on_ready():
 
 @bot.event
 async def on_message(message):
-    """初めてDMを送ってきたユーザーに、使い方ガイドを一度だけ自動で送る"""
-    if message.author.bot:
+    """BotへのDMに反応する。
+
+    ・初めてDMを送ってきたユーザーに、使い方を一度だけ自動で送る
+    ・昔の「!」から始まるコマンドには、「/」に変わったことを案内する
+    （コマンド自体は、スラッシュコマンドで処理される）
+    """
+    if message.author.bot or not isinstance(message.channel, discord.DMChannel):
         return
 
-    if isinstance(message.channel, discord.DMChannel):
-        user_id = message.author.id
-        if not database.has_seen_guide(user_id):
-            database.mark_guide_shown(user_id)
-            # 最初のメッセージが「!使い方」「!help」なら、コマンド側がガイドを送るので重複させない
-            ctx = await bot.get_context(message)
-            if ctx.command is None or ctx.command.name != "使い方":
-                try:
-                    for text in GUIDE_MESSAGES:
-                        await message.channel.send(text)
-                except Exception as e:
-                    log.warning("ユーザー %s へのガイド送信失敗: %s", user_id, type(e).__name__)
+    user_id = message.author.id
+    content = (message.content or "").strip()
+    first = not database.has_seen_guide(user_id)
+    if first:
+        database.mark_guide_shown(user_id)
 
-    await bot.process_commands(message)
+    texts = []
+    if content.startswith("!"):
+        texts.append(LEGACY_TEXT)
+    if first:
+        texts.extend(help_texts(user_id))
+
+    try:
+        for text in texts:
+            await message.channel.send(text)
+    except Exception as e:
+        log.warning("ユーザー %s へのDM返信に失敗: %s", user_id, type(e).__name__)
 
 
 # --------------------------------------------------
-# コマンド各種
+# スラッシュコマンド
 # --------------------------------------------------
-
-# 使い方ガイド（Botの使い方 + URLの取得方法）
-@bot.command(name="使い方", aliases=["help"])
-async def show_help(ctx):
-    for text in GUIDE_MESSAGES:
-        await ctx.send(text)
+@everywhere
+@tree.command(name="使い方", description="Botの使い方を表示します")
+async def cmd_help(interaction: discord.Interaction):
+    await send_all(interaction, help_texts(interaction.user.id))
 
 
-# 手動でMoodleの予定を取得するコマンド
-# （通知済みかどうかに関係なく今後の予定をすべて表示。結果は送信者本人のDMにのみ届く）
-@bot.command(name="moodle")
-async def send_moodle_schedule(ctx):
-    user_id = ctx.author.id
-    in_guild = not isinstance(ctx.channel, discord.DMChannel)
-    ics_url = user_urls.get(user_id)
+@everywhere
+@tree.command(name="help", description="Botの使い方を表示します（/使い方 と同じ）")
+async def cmd_help_en(interaction: discord.Interaction):
+    await send_all(interaction, help_texts(interaction.user.id))
 
-    # 最初のDMで、DMが送れるかも同時に確認する
-    first = (
-        "Moodleから最新の予定を取得中..."
-        if ics_url
-        else "❌ MoodleのカレンダーURLが登録されていません。\n"
-        "このBotとのDMで `!url 登録 <URL>` を送信してください。取得方法は `!使い方` で確認できます。"
-    )
-    if not await reply_dm(ctx, first):
+
+@everywhere
+@tree.command(name="moodle", description="今後の予定を今すぐ確認します")
+async def cmd_moodle(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    url = user_urls.get(user_id)
+    if not url:
+        await send(interaction, NEED_REGISTER_TEXT)
         return
-    database.clear_dm_block(user_id)  # DMが送れたので、拒否中の記録は解除する
-    if in_guild:
-        await ctx.send(f"{ctx.author.mention} 結果をDMでお送りします📩")
-    if not ics_url:
-        return
+
+    # 取得に時間がかかることがあるので、いったん「処理中」にしてから返信する
+    await interaction.response.defer(ephemeral=use_ephemeral(interaction), thinking=True)
 
     prefs = load_prefs(user_id)
     try:
-        result = await fetch_for_user(ics_url, prefs)
+        result = await fetch_for_user(url, prefs)
     except moodle.MoodleError as e:
         # 手動コマンドなので、失敗はその場で本人に伝える
-        await reply_dm(ctx, f"❌ {e}")
+        await send(interaction, f"❌ {e}")
         return
 
     if not result.events:
-        await reply_dm(ctx, explain_empty(result, prefs))
+        await send(interaction, explain_empty(result, prefs))
         return
-
-    for chunk in chunk_lines(
-        "**【Moodle 予定一覧】**", [ev.format() for ev in result.events]
-    ):
-        if not await reply_dm(ctx, chunk):
-            return
+    for chunk in chunk_lines("**【Moodle 予定一覧】**", [ev.format() for ev in result.events]):
+        await send(interaction, chunk)
 
 
-async def manage_word_list(
-    ctx,
-    action,
-    word,
-    *,
-    cmd,
-    header,
-    mark,
-    empty_text,
-    notes,
-    get_words,
-    add_word,
-    delete_word,
-    added_text,
-    removed_text,
-):
-    """フィルター／除外ワードの共通処理（どちらもユーザーごとに保存される）"""
-    user_id = ctx.author.id
+# ---- /url ----
+class UrlModal(discord.ui.Modal, title="MoodleカレンダーURLの登録"):
+    """URLを入力するポップアップ。入力内容は他の人に見えない。"""
 
-    # 設定はURL登録時に作られるため、先に登録してもらう
-    if user_id not in user_urls:
-        await ctx.send(
-            "先にBotとのDMで `!url 登録 <URL>` を行ってください。\n"
-            "設定はユーザーごとに保存されます。"
-        )
-        return
-
-    words = get_words(user_id)
-
-    # 1. 引数なし：現在の一覧を表示
-    if action is None:
-        if not words:
-            await ctx.send(empty_text)
-            return
-        msg = header + "\n" + "".join(f"・{w}：{mark}\n" for w in words)
-        msg += "\n※大文字小文字・全角半角は区別しません"
-        msg += f"\n※追加する場合: `!{cmd} 追加 <単語>`\n※削除する場合: `!{cmd} 削除 <単語>`"
-        msg += notes
-        await ctx.send(msg)
-
-    # 2. 追加
-    elif action in ["登録", "追加"]:
-        if word is None:
-            await ctx.send(f"追加する単語を指定してください。\n例: `!{cmd} 追加 レポート`")
-            return
-        word = word.strip()
-        problem = validate_word(word)
-        if problem:
-            await ctx.send(f"❌ {problem}")
-            return
-        # 大文字小文字・全角半角の違いだけの重複は登録しない
-        if any(moodle.normalize_text(w) == moodle.normalize_text(word) for w in words):
-            await ctx.send(f"「{word}」は既に登録されています。")
-        elif len(words) >= MAX_WORDS_PER_LIST:
-            await ctx.send(
-                f"❌ 登録できるのは最大{MAX_WORDS_PER_LIST}個までです。"
-                f"不要なものを `!{cmd} 削除 <単語>` で削除してから追加してください。"
-            )
-        else:
-            add_word(user_id, word)
-            await ctx.send(added_text.format(word=word))
-
-    # 3. 削除
-    elif action == "削除":
-        if word is None:
-            await ctx.send(f"削除する単語を指定してください。\n例: `!{cmd} 削除 テスト`")
-            return
-        # 登録時の表記と大文字小文字が違っていても削除できる
-        target = next(
-            (w for w in words if moodle.normalize_text(w) == moodle.normalize_text(word)),
-            None,
-        )
-        if target is not None:
-            delete_word(user_id, target)
-            await ctx.send(removed_text.format(word=target))
-        else:
-            await ctx.send(f"「{short(word)}」は登録されていません。")
-
-    else:
-        await ctx.send(
-            f"使い方: `!{cmd}`（一覧） / `!{cmd} 追加 <単語>` / `!{cmd} 削除 <単語>`"
-        )
-
-
-# フィルター管理コマンド（一致する予定だけ通知。空なら全予定）
-@bot.command(name="フィルター")
-async def manage_filter(ctx, action: str = None, word: str = None):
-    await manage_word_list(
-        ctx,
-        action,
-        word,
-        cmd="フィルター",
-        header="**【あなたの通知フィルター設定】**",
-        mark="✅",
-        empty_text=(
-            "現在、フィルターは未設定です。**すべての予定**が通知・表示されます。\n"
-            "※絞り込む場合: `!フィルター 追加 <単語>`"
-        ),
-        notes="\n※すべて削除すると、全予定が通知されます",
-        get_words=database.get_filter_words,
-        add_word=database.add_filter_word,
-        delete_word=database.delete_filter_word,
-        added_text="フィルターに「**{word}**」を追加しました！✅",
-        removed_text="フィルターから「**{word}**」を削除しました。❌",
+    url = discord.ui.TextInput(
+        label="カレンダーURL",
+        placeholder="https://… （Moodleで取得したURLを貼り付け）",
+        max_length=MAX_URL_LENGTH,
     )
 
-
-# 除外ワード管理コマンド（ブラックリスト。一致する予定は常に通知しない）
-@bot.command(name="除外", aliases=["ブラックリスト"])
-async def manage_exclude(ctx, action: str = None, word: str = None):
-    await manage_word_list(
-        ctx,
-        action,
-        word,
-        cmd="除外",
-        header="**【あなたの除外ワード設定】**",
-        mark="🚫",
-        empty_text=(
-            "現在、除外ワードは設定されていません。\n"
-            "※追加する場合: `!除外 追加 <単語>`"
-        ),
-        notes="\n※除外ワードを含む予定は、フィルターに一致しても通知されません",
-        get_words=database.get_exclude_words,
-        add_word=database.add_exclude_word,
-        delete_word=database.delete_exclude_word,
-        added_text="除外ワードに「**{word}**」を追加しました！🚫",
-        removed_text="除外ワードから「**{word}**」を削除しました。",
-    )
-
-
-# 定刻通知の時刻管理コマンド
-@bot.command(name="通知時間")
-async def manage_notify_time(ctx, action: str = None, *times: str):
-    user_id = ctx.author.id
-    if user_id not in user_urls:
-        await ctx.send(
-            "先にBotとのDMで `!url 登録 <URL>` を行ってください。\n"
-            "設定はユーザーごとに保存されます。"
-        )
-        return
-
-    # 「!通知時間 8:30 18:00」のように、「設定」を省略した形も受け付ける
-    if action is not None and parse_hhmm(action) is not None:
-        action, times = "設定", (action, *times)
-
-    # 1. 引数なし：現在の設定を表示
-    if action is None:
-        current = database.get_notify_times(user_id)
-        period = database.get_period_days(user_id)
-        days = min(period, DIGEST_MAX_DAYS) if period else DIGEST_MAX_DAYS
-        if current:
-            head = (
-                f"**【定刻通知の設定】**\n毎日 {' / '.join(current)} に、"
-                f"今後{days}日間の予定一覧をお知らせします。\n"
-            )
-        else:
-            head = "**【定刻通知の設定】**\n現在、定刻通知は**オフ**です。\n"
-        await ctx.send(
-            head
-            + f"\n※変更: `!通知時間 設定 8:30 18:00`（最大{MAX_NOTIFY_TIMES}つ）"
-            + "\n※停止: `!通知時間 オフ`　※初期設定に戻す: `!通知時間 初期化`"
-            + "\n※時刻は日本時間です。対象の予定が1件もない時は送信されません。"
-        )
-
-    # 2. 設定
-    elif action == "設定":
-        parsed = [parse_hhmm(t) for t in times]
-        if not times or None in parsed:
-            await ctx.send(
-                "時刻は `8:30` のように指定してください（0:00〜23:59）。\n"
-                "例: `!通知時間 設定 8:30 18:00`"
-            )
+    async def on_submit(self, interaction: discord.Interaction):
+        ok, message, is_new = register_url(interaction.user.id, self.url.value)
+        await send(interaction, message)
+        if not ok:
             return
-        unique = sorted(set(parsed))
-        if len(unique) > MAX_NOTIFY_TIMES:
-            await ctx.send(f"登録できる時刻は最大{MAX_NOTIFY_TIMES}つまでです。")
-            return
-        database.set_notify_times(user_id, unique)
-        await ctx.send(f"定刻通知を毎日 {' / '.join(unique)} に設定しました！⏰")
-
-    # 3. オフ
-    elif action in ["オフ", "off", "OFF", "停止"]:
-        database.set_notify_times(user_id, [])
-        await ctx.send("定刻通知をオフにしました。再開は `!通知時間 初期化` または `!通知時間 設定 ...` です。")
-
-    # 4. 初期化
-    elif action == "初期化":
-        database.set_notify_times(user_id, None)
-        await ctx.send(
-            f"定刻通知を初期設定（毎日 {' / '.join(database.get_notify_times(user_id))}）に戻しました。"
-        )
-
-    else:
-        await ctx.send(
-            "使い方: `!通知時間`（確認） / `!通知時間 設定 8:30 18:00` / `!通知時間 オフ` / `!通知時間 初期化`"
-        )
-
-
-# 通知する期間の管理コマンド
-@bot.command(name="期間")
-async def manage_period(ctx, value: str = None):
-    user_id = ctx.author.id
-    if user_id not in user_urls:
-        await ctx.send(
-            "先にBotとのDMで `!url 登録 <URL>` を行ってください。\n"
-            "設定はユーザーごとに保存されます。"
-        )
-        return
-
-    note = (
-        "\n※期間を広げても、カレンダーURLを発行したときの期間（Moodleのエクスポート範囲）"
-        "より先の予定は取得できません。"
-    )
-
-    # 1. 引数なし：現在の設定を表示
-    if value is None:
-        days = database.get_period_days(user_id)
-        if days:
-            await ctx.send(
-                f"通知する予定の期間: **今後{days}日以内**\n"
-                "※変更: `!期間 14`　※解除: `!期間 解除`" + note
-            )
-        else:
-            await ctx.send(
-                "通知する予定の期間: **制限なし**（カレンダーにある今後の予定すべて）\n"
-                "※絞り込む場合: `!期間 7`（今後7日以内）" + note
-            )
-        return
-
-    # 2. 解除
-    if value in ["解除", "なし", "off", "OFF"]:
-        database.set_period_days(user_id, None)
-        await ctx.send("期間の制限を解除しました。")
-        return
-
-    # 3. 設定
-    days = parse_days(value)
-    if days is None:
-        await ctx.send("日数は1〜365の数字で指定してください。\n例: `!期間 7`")
-        return
-    database.set_period_days(user_id, days)
-    await ctx.send(f"通知する予定を**今後{days}日以内**に絞りました！📆" + note)
-
-
-# 4.URL登録コマンド
-@bot.command(name="url")
-async def manage_url(ctx, action: str = None, url: str = None):
-    user_id = ctx.author.id
-
-    # コマンドの送信先がDM（プライベートチャット）かチェック
-    if not isinstance(ctx.channel, discord.DMChannel):
-        # URL（認証トークン入り）をサーバーのチャンネルに送ってしまった場合は、
-        # 公開されたままにならないよう、そのメッセージの削除を試みる
-        deleted = False
-        if url is not None:
-            try:
-                await ctx.message.delete()
-                deleted = True
-            except Exception as e:  # 権限不足（Manage Messages）など
-                log.warning("URLを含むメッセージを削除できませんでした: %s", type(e).__name__)
-        msg = (
-            f"{ctx.author.mention} セキュリティのため、URLの登録・確認は"
-            "Botとの**DM（ダイレクトメッセージ）**で行ってください！"
-        )
-        if url is not None:
-            if deleted:
-                msg += (
-                    "\n⚠️ URLを含むメッセージは削除しましたが、一度公開された可能性があります。"
-                    "念のため、MoodleでURLを取得し直して（可能なら古いURLを無効にして）から、DMで登録してください。"
-                )
-            else:
-                msg += (
-                    "\n⚠️ URLを含むメッセージを削除できませんでした。**お手数ですがご自身で削除**し、"
-                    "MoodleでURLを取得し直してから、DMで登録してください。"
-                )
-        await ctx.send(msg)
-        return
-
-    # 1. 引数なし：登録状況の確認
-    if action is None:
-        if user_id in user_urls:
-            await ctx.send(
-                "✅ MoodleのカレンダーURLは登録済みです。\n更新する場合は `!url 登録 <新しいURL>` と送信してください。"
-            )
-        else:
-            await ctx.send(
-                "❌ URLが登録されていません。\n`!url 登録 <Moodleの.ics URL>` と送信して登録してください。\n"
-                "取得方法は `!使い方` で確認できます。"
-            )
-
-    # 2. URLの登録
-    elif action == "登録":
-        if url is None:
-            await ctx.send(
-                "URLを指定してください。\n例: `!url 登録 https://...`\n取得方法は `!使い方` で確認できます。"
-            )
-            return
-        # https かつ許可ドメインのURLだけを受け付ける（入力されたURLは返信に含めない）
-        problem = moodle.check_url(url)
-        if problem:
-            await ctx.send(f"❌ {problem}\n取得方法は `!使い方` で確認できます。")
-            return
-
-        # URLをDBに保存（新規ユーザーならデフォルトのフィルターも登録される）
-        user_urls[user_id] = url
-        is_new = database.save_user_url(user_id, url)
-        database.clear_dm_block(user_id)  # DMで操作してきたので、拒否中の記録は解除する
-        msg = "✅ MoodleのカレンダーURLを登録しました！"
+        await verify_dm(interaction)
         if is_new:
-            msg += "\n通知フィルターは初期設定になっています。`!フィルター` で確認・変更できます。"
-        await ctx.send(msg)
+            # URL登録が正しくできたので、使えるコマンドを案内する
+            await send(interaction, COMMANDS_GUIDE_TEXT)
 
-    # 3. URLの削除
-    elif action == "削除":
-        if user_id in user_urls:
-            del user_urls[user_id]
-            database.delete_user_url(user_id)  # フィルター・設定・通知履歴なども削除される
-            await ctx.send("🗑️ 登録されていたURLと各種設定を削除しました。")
-        else:
-            await ctx.send("登録されているURLはありません。")
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        log_unexpected("URL登録", error)
+        try:
+            await send(interaction, "⚠️ 予期しないエラーが発生しました。もう一度お試しください。")
+        except Exception:
+            pass
+
+
+url_group = everywhere(
+    app_commands.Group(name="url", description="MoodleのカレンダーURLの登録・確認・削除")
+)
+
+
+@url_group.command(name="登録", description="MoodleのカレンダーURLを登録・更新します（入力欄が開きます）")
+async def cmd_url_register(interaction: discord.Interaction):
+    await interaction.response.send_modal(UrlModal())
+
+
+@url_group.command(name="確認", description="URLが登録済みかを確認します")
+async def cmd_url_status(interaction: discord.Interaction):
+    await send(interaction, url_status_text(interaction.user.id))
+
+
+@url_group.command(name="削除", description="登録したURLと、すべての設定・通知履歴を削除します")
+async def cmd_url_delete(interaction: discord.Interaction):
+    await send(interaction, url_delete_text(interaction.user.id))
+
+
+# ---- /フィルター ----
+filter_group = everywhere(
+    app_commands.Group(name="フィルター", description="通知する予定のキーワード（未設定なら全予定）")
+)
+
+
+@filter_group.command(name="一覧", description="登録中のフィルターを表示します")
+async def cmd_filter_list(interaction: discord.Interaction):
+    await send(interaction, words_list_text(FILTER_KIND, interaction.user.id))
+
+
+@filter_group.command(name="追加", description="その単語を含む予定だけを通知します")
+@app_commands.describe(単語="授業名や「課題」「小テスト」など（50文字まで）")
+async def cmd_filter_add(interaction: discord.Interaction, 単語: str):
+    await send(interaction, add_word_text(FILTER_KIND, interaction.user.id, 単語))
+
+
+@filter_group.command(name="削除", description="フィルターの単語を削除します")
+@app_commands.describe(単語="削除する単語")
+async def cmd_filter_delete(interaction: discord.Interaction, 単語: str):
+    await send(interaction, delete_word_text(FILTER_KIND, interaction.user.id, 単語))
+
+
+@cmd_filter_delete.autocomplete("単語")
+async def ac_filter_delete(interaction: discord.Interaction, current: str):
+    words = word_choices(FILTER_KIND, interaction.user.id, current)
+    return [app_commands.Choice(name=w, value=w) for w in words]
+
+
+# ---- /除外 ----
+exclude_group = everywhere(
+    app_commands.Group(name="除外", description="通知しない予定のキーワード（フィルターより優先）")
+)
+
+
+@exclude_group.command(name="一覧", description="登録中の除外ワードを表示します")
+async def cmd_exclude_list(interaction: discord.Interaction):
+    await send(interaction, words_list_text(EXCLUDE_KIND, interaction.user.id))
+
+
+@exclude_group.command(name="追加", description="その単語を含む予定を通知しません")
+@app_commands.describe(単語="通知したくない単語（50文字まで）")
+async def cmd_exclude_add(interaction: discord.Interaction, 単語: str):
+    await send(interaction, add_word_text(EXCLUDE_KIND, interaction.user.id, 単語))
+
+
+@exclude_group.command(name="削除", description="除外ワードを削除します")
+@app_commands.describe(単語="削除する単語")
+async def cmd_exclude_delete(interaction: discord.Interaction, 単語: str):
+    await send(interaction, delete_word_text(EXCLUDE_KIND, interaction.user.id, 単語))
+
+
+@cmd_exclude_delete.autocomplete("単語")
+async def ac_exclude_delete(interaction: discord.Interaction, current: str):
+    words = word_choices(EXCLUDE_KIND, interaction.user.id, current)
+    return [app_commands.Choice(name=w, value=w) for w in words]
+
+
+# ---- /通知時間 ----
+notify_group = everywhere(
+    app_commands.Group(name="通知時間", description="毎日の定刻通知（予定のまとめ）の時刻")
+)
+
+
+@notify_group.command(name="確認", description="現在の定刻通知の設定を表示します")
+async def cmd_notify_show(interaction: discord.Interaction):
+    await send(interaction, notify_time_text(interaction.user.id))
+
+
+@notify_group.command(name="設定", description="定刻通知の時刻を変更します（最大4つ）")
+@app_commands.describe(時刻="例: 8:30 18:00 （複数はスペース区切り・日本時間）")
+async def cmd_notify_set(interaction: discord.Interaction, 時刻: str):
+    await send(interaction, set_notify_times_text(interaction.user.id, 時刻))
+
+
+@notify_group.command(name="オフ", description="毎日の定刻通知を止めます")
+async def cmd_notify_off(interaction: discord.Interaction):
+    await send(interaction, notify_time_off_text(interaction.user.id))
+
+
+@notify_group.command(name="初期化", description="定刻通知を初期設定（8:30 / 18:00）に戻します")
+async def cmd_notify_reset(interaction: discord.Interaction):
+    await send(interaction, notify_time_reset_text(interaction.user.id))
+
+
+# ---- /期間 ----
+period_group = everywhere(
+    app_commands.Group(name="期間", description="通知する予定の期間（今後何日以内か）")
+)
+
+
+@period_group.command(name="確認", description="現在の期間の設定を表示します")
+async def cmd_period_show(interaction: discord.Interaction):
+    await send(interaction, period_text(interaction.user.id))
+
+
+@period_group.command(name="設定", description="通知する予定を、今後◯日以内に絞ります")
+@app_commands.describe(日数="今後何日以内か（1〜365）")
+async def cmd_period_set(interaction: discord.Interaction, 日数: app_commands.Range[int, 1, 365]):
+    await send(interaction, set_period_text(interaction.user.id, 日数))
+
+
+@period_group.command(name="解除", description="期間の制限をなくします")
+async def cmd_period_clear(interaction: discord.Interaction):
+    await send(interaction, clear_period_text(interaction.user.id))
+
+
+for _group in (url_group, filter_group, exclude_group, notify_group, period_group):
+    tree.add_command(_group)
+
+
+@tree.error
+async def on_app_command_error(interaction: discord.Interaction, error):
+    """コマンド実行中の想定外のエラー。詳細はターミナルにだけ出し（URL・トークンは伏せる）、
+    ユーザーには簡単なお知らせだけを返す。"""
+    name = getattr(getattr(interaction, "command", None), "qualified_name", "?")
+    log_unexpected(f"コマンド /{name}（ユーザー {interaction.user.id}）", error)
+    try:
+        await send(interaction, "⚠️ 予期しないエラーが発生しました。時間をおいて、もう一度お試しください。")
+    except Exception:
+        pass
 
 
 try:
@@ -854,9 +1048,4 @@ except discord.LoginFailure:
     sys.exit(
         "【エラー】DISCORD_TOKEN が無効です。\n"
         "Discord Developer Portal でトークンを再発行し、.env を更新してください。"
-    )
-except discord.PrivilegedIntentsRequired:
-    sys.exit(
-        "【エラー】MESSAGE CONTENT INTENT が有効になっていません。\n"
-        "Discord Developer Portal の Bot 設定で「Message Content Intent」をオンにしてください。"
     )

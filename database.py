@@ -123,6 +123,13 @@ def init_db() -> dict:
                 user_id INTEGER PRIMARY KEY
             )
         """)
+        # Bot全体の小さな記録（例: 最後にコマンドを同期したときの COMMANDS_VERSION）
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
 
         _migrate_global_filters(conn)
 
@@ -363,3 +370,15 @@ def has_seen_guide(user_id: int) -> bool:
 def mark_guide_shown(user_id: int):
     with _connect() as conn:
         conn.execute("INSERT OR IGNORE INTO guide_shown (user_id) VALUES (?)", (user_id,))
+
+
+# --- Bot全体の記録 ---
+def get_meta(key: str) -> Optional[str]:
+    with _connect() as conn:
+        row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def set_meta(key: str, value: str):
+    with _connect() as conn:
+        conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
