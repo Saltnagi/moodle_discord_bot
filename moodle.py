@@ -16,10 +16,26 @@ from config import (
     MOODLE_ALLOWED_HOSTS,
     REQUEST_TIMEOUT,
 )
+from syllabus import CourseNameResolver, parse_course_key
 
 log = logging.getLogger(__name__)
 
 JST = ZoneInfo("Asia/Tokyo")
+
+
+def format_event_line(
+    start_str: str,
+    summary: str,
+    course_raw: str,
+    resolver: Optional[CourseNameResolver] = None,
+) -> str:
+    """解決できた場合: ・[日時] 【情報工学基礎】課題名
+    解決できない場合: ・[日時] 課題名 （コードは載せない）"""
+    resolved = resolver.resolve(course_raw) if (resolver and course_raw) else None
+    if not resolved and course_raw:
+        resolved = display_course(course_raw)
+    prefix = f"【{resolved}】" if resolved else ""
+    return f"・[{start_str}] {prefix}{summary}"
 
 
 def normalize_text(text: str) -> str:
@@ -229,7 +245,7 @@ def _http_get(ics_url: str):
             log.warning("許可されていないURLへのアクセスをブロックしました")
             raise MoodleError(
                 "登録されているURLは許可されていません。"
-                "`!url 登録` で、大学のMoodleのカレンダーURLを登録し直してください。"
+                "`/url 登録` で、大学のMoodleのカレンダーURLを登録し直してください。"
             )
         try:
             response = requests.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=False)
@@ -253,12 +269,14 @@ def fetch_events(
     now=None,
     exclude_words=None,
     max_days: Optional[int] = None,
+    resolver: Optional[CourseNameResolver] = None,
 ) -> FetchResult:
     """Moodleから予定を取得し、条件に合う「これから」の予定を返す。
 
     - filter_words : どれかを含む予定だけを対象にする（空なら全予定が対象）
     - exclude_words: どれかを含む予定は対象から外す（フィルターより優先）
     - max_days     : 今後この日数以内に始まる予定だけを対象にする（Noneなら制限なし）
+    - resolver     : シラバスから日本語授業名を引くリゾルバ
     大文字小文字・全角半角は区別しない。
 
     失敗時は MoodleError を投げる（エラー文を予定として返さない）。
@@ -316,11 +334,24 @@ def fetch_events(
             continue
 
         summary = str(component.get("summary", ""))
-        course_raw = _get_course(component)  # コース略称。表示には使わない
-        course = display_course(course_raw)  # 日本語の授業名だけ。無ければ空
+        course_raw = _get_course(component)  # コース略称（例: 2026UCS258）
+        if not course_raw:
+            # categoriesに無い場合、descriptionやsummaryから探す
+            desc = str(component.get("description", ""))
+            m = parse_course_key(desc) or parse_course_key(summary)
+            if m:
+                course_raw = f"{m.year}{m.code}"
+
+        # シラバスから日本語授業名を解決。解決できなければICS内の日本語判定を試みる
+        resolved_name = resolver.resolve(course_raw) if (resolver and course_raw) else None
+        if not resolved_name and course_raw:
+            resolved_name = display_course(course_raw)
+
+        # 解決できなければ空文字（授業コードは絶対に表示しない）
+        course = resolved_name or ""
+
         # フィルター・除外は「予定名」「授業名」「コース略称（コード）」が対象
-        # （コードで絞り込めるよう、表示しないコードも照合には使う）
-        norm_summary = normalize_text(f"{summary} {course_raw}")
+        norm_summary = normalize_text(f"{summary} {course_raw} {course}")
 
         # フィルターが空なら全予定を対象にする
         if norm_words and not any(w in norm_summary for w in norm_words):

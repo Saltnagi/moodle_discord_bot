@@ -130,6 +130,17 @@ def init_db() -> dict:
                 value TEXT NOT NULL
             )
         """)
+        # シラバスの授業名キャッシュ（全ユーザー共有）
+        # name が NULL の場合は「シラバスに見つからなかった（ネガティブキャッシュ）」を表す
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS courses (
+                year       INTEGER NOT NULL,
+                code       TEXT    NOT NULL,
+                name       TEXT,
+                fetched_at TEXT    NOT NULL,
+                PRIMARY KEY (year, code)
+            )
+        """)
 
         _migrate_global_filters(conn)
 
@@ -382,3 +393,42 @@ def get_meta(key: str) -> Optional[str]:
 def set_meta(key: str, value: str):
     with _connect() as conn:
         conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
+
+
+# --- シラバスの授業名キャッシュ操作 ---
+COURSE_HIT_TTL_DAYS = 180
+COURSE_MISS_TTL_DAYS = 7
+
+
+def get_course_name(year: int, code: str) -> tuple[bool, Optional[str]]:
+    """(有効なキャッシュがあるか, 授業名 or None)。TTL判定はここで統一"""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT name, fetched_at FROM courses WHERE year = ? AND code = ?",
+            (year, code),
+        ).fetchone()
+    if not row:
+        return False, None
+
+    name, fetched_at_str = row[0], row[1]
+    try:
+        fetched_at = datetime.datetime.strptime(fetched_at_str, _TS).replace(tzinfo=JST)
+    except Exception:
+        return False, None
+
+    now = datetime.datetime.now(JST)
+    ttl_days = COURSE_HIT_TTL_DAYS if name is not None else COURSE_MISS_TTL_DAYS
+    if now - fetched_at > datetime.timedelta(days=ttl_days):
+        return False, None
+
+    return True, name
+
+
+def save_course_name(year: int, code: str, name: Optional[str]) -> None:
+    """nameがNoneならネガティブキャッシュとして保存"""
+    now_str = datetime.datetime.now(JST).strftime(_TS)
+    with _connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO courses (year, code, name, fetched_at) VALUES (?, ?, ?, ?)",
+            (year, code, name, now_str),
+        )

@@ -14,6 +14,7 @@ from discord.ext import tasks
 
 import database
 import moodle
+import syllabus
 from config import (
     CHECK_INTERVAL_MINUTES,
     COMMANDS_VERSION,
@@ -201,10 +202,20 @@ def load_prefs(user_id: int) -> Prefs:
     )
 
 
+syllabus_client = syllabus.YamanashiSyllabusClient()
+course_resolver = syllabus.CourseNameResolver(syllabus_client)
+
+
 async def fetch_for_user(url: str, prefs: Prefs, now=None) -> moodle.FetchResult:
     """同期関数のfetch_eventsを別スレッドで実行し、Botを止めない"""
     return await asyncio.to_thread(
-        moodle.fetch_events, url, prefs.words, now, prefs.excludes, prefs.max_days
+        moodle.fetch_events,
+        url,
+        prefs.words,
+        now,
+        prefs.excludes,
+        prefs.max_days,
+        course_resolver,
     )
 
 

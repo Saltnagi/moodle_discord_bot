@@ -3,9 +3,12 @@ import os
 import sys
 from pathlib import Path
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
-load_dotenv()
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 
 
