@@ -390,12 +390,12 @@ class MoodleBot(discord.Client):
     async def setup_hook(self):
         # コマンドの変更があったときだけ、Discordへ再登録（同期）する
         stored = database.get_meta("commands_version")
-        if SYNC_COMMANDS or stored != COMMANDS_VERSION:
-            synced = await self.tree.sync()
-            database.set_meta("commands_version", COMMANDS_VERSION)
-            log.info("スラッシュコマンドをDiscordに同期しました（%d件）", len(synced))
-        else:
-            log.info("スラッシュコマンドは同期済みです（バージョン %s）", COMMANDS_VERSION)
+        # if SYNC_COMMANDS or stored != COMMANDS_VERSION:
+        synced = await self.tree.sync()
+        database.set_meta("commands_version", COMMANDS_VERSION)
+        log.info("スラッシュコマンドをDiscordに同期しました（%d件）", len(synced))
+        # else:
+        #     log.info("スラッシュコマンドは同期済みです（バージョン %s）", COMMANDS_VERSION)
 
         # 導入リンクをターミナルに表示する
         if self.application_id:
