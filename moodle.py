@@ -38,6 +38,155 @@ def format_event_line(
     return f"・[{start_str}] {prefix}{summary}"
 
 
+WEEKDAYS = ["月", "火", "水", "木", "金", "土", "日"]
+
+
+def underline(text: str) -> str:
+    """数値をDiscordの下線装飾で囲む"""
+    return f"__{text}__"
+
+
+def urgency_mark(remaining: datetime.timedelta) -> str:
+    """緊急度マーク（🔴 24時間以内 / 🟡 72時間以内 / ⚪ それ以降）"""
+    secs = remaining.total_seconds()
+    if secs <= 24 * 3600:
+        return "🔴"
+    elif secs <= 72 * 3600:
+        return "🟡"
+    return "⚪"
+
+
+def format_remaining(remaining: datetime.timedelta) -> str:
+    """残り時間を 'あと__5__時間' の形式で返す。
+    1時間未満=分 / 24時間未満=時間 / それ以上=日"""
+    secs = max(0, int(remaining.total_seconds()))
+    if secs < 3600:
+        minutes = max(1, secs // 60)
+        return f"あと{underline(str(minutes))}分"
+    elif secs < 86400:
+        hours = max(1, secs // 3600)
+        return f"あと{underline(str(hours))}時間"
+    else:
+        days = max(1, secs // 86400)
+        return f"あと{underline(str(days))}日"
+
+
+def format_date_heading(dt: datetime.datetime, now: datetime.datetime) -> str:
+    """日付見出し行（例: '__10/20__(火)'、年が異なる場合は '__2027/1/5__(火)'）"""
+    wd = WEEKDAYS[dt.weekday()]
+    if dt.year == now.year:
+        date_str = f"{dt.month}/{dt.day}"
+    else:
+        date_str = f"{dt.year}/{dt.month}/{dt.day}"
+    return f"{underline(date_str)}({wd})"
+
+
+def format_single_event(ev: "MoodleEvent", now: datetime.datetime) -> str:
+    """1件の予定の表示文字列を作る。
+    例:
+    🔴 __23:59__（あと__5__時間）
+    【情報工学基礎】
+    　課題1 提出
+    """
+    due = ev.due_at(now)
+    lines = []
+
+    if ev.all_day:
+        # 終日予定: 日付差から緊急度判定。時刻と「あと◯◯」は省略
+        days_diff = (ev.start.date() - now.date()).days
+        mark = urgency_mark(datetime.timedelta(days=days_diff))
+        lines.append(mark)
+    else:
+        # 通常予定: 期限日時から緊急度・残り時間を判定
+        target_dt = due if due is not None else ev.start
+        rem = target_dt - now
+        mark = urgency_mark(rem)
+        hhmm = target_dt.strftime("%H:%M")
+        rem_str = format_remaining(rem)
+        lines.append(f"{mark} {underline(hhmm)}（{rem_str}）")
+
+    # 授業名（取得できている場合のみ表示、コードは載せない）
+    if ev.course:
+        lines.append(f"【{ev.course}】")
+
+    # 課題名（全角スペース1つでインデント）
+    lines.append(f"　{ev.summary}")
+
+    return "\n".join(lines)
+
+
+def format_events(
+    events: list["MoodleEvent"],
+    now: datetime.datetime,
+    header: Optional[str] = None,
+    limit: int = 1950,
+) -> list[str]:
+    """予定一覧を新フォーマットで整形し、2000文字制限に収まるよう分割したリストを返す。"""
+    if not events:
+        return []
+
+    from collections import defaultdict
+
+    # 期限日時（なければ開始日時）でソート
+    sorted_events = sorted(events, key=lambda e: e.due_at(now) or e.start)
+
+    # 日付ごとにグループ化
+    groups = defaultdict(list)
+    for ev in sorted_events:
+        target_dt = ev.due_at(now) or ev.start
+        groups[target_dt.date()].append(ev)
+
+    chunks: list[str] = []
+    current_lines: list[str] = []
+
+    if header:
+        current_lines.append(header)
+
+    for date_key, ev_list in groups.items():
+        rep_dt = ev_list[0].due_at(now) or ev_list[0].start
+        date_heading = format_date_heading(rep_dt, now)
+
+        event_blocks = [format_single_event(ev, now) for ev in ev_list]
+        group_body = "\n\n".join(event_blocks)
+        full_group_str = f"{date_heading}\n{group_body}"
+
+        # 現在のチャンクにグループ全体が追加できるか試す
+        prefix = "\n\n" if current_lines else ""
+        candidate = "\n".join(current_lines) + prefix + full_group_str
+        if len(candidate) <= limit:
+            if current_lines:
+                current_lines.append("")
+            current_lines.append(full_group_str)
+        else:
+            # 入らない場合: 現在のチャンクを確定
+            if current_lines:
+                chunks.append("\n".join(current_lines).strip())
+                current_lines = []
+
+            # 新規チャンクでグループ全体が入るか？
+            if len(full_group_str) <= limit:
+                current_lines.append(full_group_str)
+            else:
+                # 1つの日付グループだけでlimitを超える場合: 予定単位で分割
+                current_lines.append(date_heading)
+                for ev_block in event_blocks:
+                    candidate_single = "\n".join(current_lines) + "\n\n" + ev_block
+                    if len(candidate_single) <= limit:
+                        current_lines.append("")
+                        current_lines.append(ev_block)
+                    else:
+                        chunks.append("\n".join(current_lines).strip())
+                        # 次のチャンクにも同じ日付見出しを再掲して継続
+                        current_lines = [date_heading, "", ev_block]
+
+    if current_lines:
+        final_text = "\n".join(current_lines).strip()
+        if final_text:
+            chunks.append(final_text)
+
+    return chunks
+
+
 def normalize_text(text: str) -> str:
     """フィルター判定用の正規化。大文字小文字と、全角/半角の違いを無視できるようにする。
     （例: "Report" / "report" / "ＲＥＰＯＲＴ" はすべて同じ扱い）"""

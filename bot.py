@@ -597,14 +597,14 @@ def clear_period_text(user_id: int) -> str:
 # --------------------------------------------------
 # DM通知の送信
 # --------------------------------------------------
-async def deliver(user_id: int, header: str, lines: list, now: datetime.datetime) -> bool:
-    """ユーザーにDMで通知する。成功したらTrue。
+async def deliver_chunks(user_id: int, chunks: list[str], now: datetime.datetime) -> bool:
+    """ユーザーにDMで通知する（複数チャンク対応）。成功したらTrue。
 
     DMを拒否されている場合は DM_RETRY_HOURS 時間後まで再送を見送る。
     """
     try:
         user = bot.get_user(user_id) or await bot.fetch_user(user_id)
-        for chunk in chunk_lines(header, lines):
+        for chunk in chunks:
             await user.send(chunk)
     except discord.Forbidden:
         retry_after = now + datetime.timedelta(hours=DM_RETRY_HOURS)
@@ -620,6 +620,10 @@ async def deliver(user_id: int, header: str, lines: list, now: datetime.datetime
         return False
     database.clear_dm_block(user_id)
     return True
+
+
+async def deliver(user_id: int, header: str, lines: list, now: datetime.datetime) -> bool:
+    return await deliver_chunks(user_id, chunk_lines(header, lines), now)
 
 
 async def verify_dm(interaction):
@@ -669,12 +673,12 @@ async def check_user(user_id: int, target_url: str, now: datetime.datetime):
         and ev.reminder_key(now) not in reminded
     ]
     if due_soon:
-        ok = await deliver(
-            user_id,
-            f"**【⏰ 提出期限が近い予定（{REMINDER_BEFORE_MINUTES}分以内）】**",
-            [format_with_remaining(ev, now) for ev in due_soon],
+        chunks = moodle.format_events(
+            due_soon,
             now,
+            header=f"【提出期限が近い予定（{REMINDER_BEFORE_MINUTES}分以内）】",
         )
+        ok = await deliver_chunks(user_id, chunks, now)
         if ok:
             database.mark_reminded(user_id, [ev.reminder_key(now) for ev in due_soon])
             # 新着として重複通知しないよう、通知済みにもしておく
@@ -688,12 +692,12 @@ async def check_user(user_id: int, target_url: str, now: datetime.datetime):
         return
 
     # 成功したときだけ通知済みとして記録する
-    if await deliver(
-        user_id,
-        "**【定期通知：Moodle 新しい予定】**",
-        [ev.format() for ev in new_events],
+    chunks = moodle.format_events(
+        new_events,
         now,
-    ):
+        header="【定期通知：Moodle 新しい予定】",
+    )
+    if await deliver_chunks(user_id, chunks, now):
         database.mark_notified(user_id, [ev.key for ev in new_events])
 
 
@@ -763,12 +767,12 @@ async def digest_user(user_id: int, target_url: str, now: datetime.datetime):
     # 予定が1件もない回は送らない（空の通知で煩わせない）。その回は送信済みとして扱う
     if events:
         latest_hhmm = max(hhmm for _, hhmm in due)
-        ok = await deliver(
-            user_id,
-            f"**【📅 定刻通知 {latest_hhmm}：今後{days}日間の予定】**",
-            [ev.format() for ev in events],
+        chunks = moodle.format_events(
+            events,
             now,
+            header=f"【定刻通知 {latest_hhmm}：今後{days}日間の予定】",
         )
+        ok = await deliver_chunks(user_id, chunks, now)
         if not ok:
             if database.is_dm_blocked(user_id, now):
                 pass  # DM拒否 → 再送は120時間後。この回は諦める
@@ -878,7 +882,9 @@ async def cmd_moodle(interaction: discord.Interaction):
     if not result.events:
         await send(interaction, explain_empty(result, prefs))
         return
-    for chunk in chunk_lines("**【Moodle 予定一覧】**", [ev.format() for ev in result.events]):
+    now = datetime.datetime.now(moodle.JST)
+    chunks = moodle.format_events(result.events, now, header="【Moodle 予定一覧】")
+    for chunk in chunks:
         await send(interaction, chunk)
 
 
