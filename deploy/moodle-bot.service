@@ -1,0 +1,26 @@
+[Unit]
+Description=Moodle Discord Notification Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=moodlebot
+Group=moodlebot
+WorkingDirectory=/opt/moodle_bot
+EnvironmentFile=/opt/moodle_bot/.env
+ExecStart=/opt/moodle_bot/.venv/bin/python bot.py
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+KillMode=mixed
+
+# セキュリティサンドボックス設定
+ProtectSystem=strict
+ReadWritePaths=/opt/moodle_bot
+ProtectHome=true
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

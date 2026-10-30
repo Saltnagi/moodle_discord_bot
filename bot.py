@@ -797,16 +797,27 @@ async def check_user(user_id: int, target_url: str, now: datetime.datetime):
         database.mark_notified(user_id, [ev.key for ev in new_events])
 
 
+# 同時リクエスト数制限のためのセマフォ
+_fetch_semaphore = asyncio.Semaphore(FETCH_CONCURRENCY)
+
+
+async def check_user_limited(user_id: int, target_url: str, now: datetime.datetime):
+    async with _fetch_semaphore:
+        await check_user(user_id, target_url, now)
+
+
 @tasks.loop(minutes=CHECK_INTERVAL_MINUTES)
 async def auto_check_moodle():
     now = datetime.datetime.now(moodle.JST)
-    for user_id, target_url in list(user_urls.items()):
-        try:
-            await check_user(user_id, target_url, now)
-        except Exception as e:
-            # 1人分の処理で想定外のエラーが出ても、他のユーザーの処理を止めない。
-            # （ループが止まると全員の通知が止まるため）。URL・トークンは伏せてログに出す。
-            log_unexpected(f"ユーザー {user_id} の自動チェック", e)
+    tasks = [
+        check_user_limited(user_id, target_url, now)
+        for user_id, target_url in list(user_urls.items())
+    ]
+    if tasks:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for r, (uid, _) in zip(results, list(user_urls.items())):
+            if isinstance(r, Exception):
+                log_unexpected(f"ユーザー {uid} の自動チェック", r)
 
     # シラバス障害（解析失敗の連続）があれば、管理者に1回だけ知らせる
     try:
@@ -889,16 +900,60 @@ async def digest_user(user_id: int, target_url: str, now: datetime.datetime):
     _digest_retry_at.pop(user_id, None)
 
 
+async def digest_user_limited(user_id: int, target_url: str, now: datetime.datetime):
+    async with _fetch_semaphore:
+        await digest_user(user_id, target_url, now)
+
+
 @tasks.loop(minutes=1)
 async def scheduled_digest():
     now = datetime.datetime.now(moodle.JST)
-    for user_id, target_url in list(user_urls.items()):
-        try:
-            await digest_user(user_id, target_url, now)
-        except Exception as e:
-            # 1人分の想定外のエラーで、他のユーザーの定刻通知を止めない
-            log_unexpected(f"ユーザー {user_id} の定刻通知", e)
-            _digest_retry_at[user_id] = now + datetime.timedelta(minutes=DIGEST_RETRY_MINUTES)
+    tasks = [
+        digest_user_limited(user_id, target_url, now)
+        for user_id, target_url in list(user_urls.items())
+    ]
+    if tasks:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for r, (uid, _) in zip(results, list(user_urls.items())):
+            if isinstance(r, Exception):
+                log_unexpected(f"ユーザー {uid} の定刻通知", r)
+                _digest_retry_at[uid] = now + datetime.timedelta(minutes=DIGEST_RETRY_MINUTES)
+
+
+# --------------------------------------------------
+# 定期実行ループ③：日次メンテナンス（午前3:30 JST）
+# 古い通知履歴・ログのクリーンアップ、DBバックアップを実行
+# --------------------------------------------------
+_MAINTENANCE_TIME = datetime.time(hour=3, minute=30, tzinfo=moodle.JST)
+
+
+@tasks.loop(time=_MAINTENANCE_TIME)
+async def daily_maintenance():
+    log.info("日次メンテナンスを開始します...")
+    now = datetime.datetime.now(moodle.JST)
+
+    # 1. 古いレコードの削除
+    try:
+        await asyncio.to_thread(database.cleanup_old_records, now)
+        log.info("古いDBレコードのクリーンアップ完了")
+    except Exception as e:
+        log_unexpected("日次メンテナンス: DBクリーンアップ", e)
+
+    # 2. DBバックアップ
+    try:
+        backup_path = await asyncio.to_thread(database.backup_db)
+        if backup_path:
+            log.info("日次DBバックアップ完了: %s", backup_path)
+    except Exception as e:
+        log_unexpected("日次メンテナンス: DBバックアップ", e)
+
+    # 3. シラバスヘルスのアラート通知確認
+    try:
+        alert = syllabus.syllabus_health.consume_alert(now)
+        if alert:
+            await notify_admin(alert)
+    except Exception as e:
+        log_unexpected("日次メンテナンス: シラバスアラート", e)
 
 
 # --------------------------------------------------
@@ -914,6 +969,8 @@ async def on_ready():
         auto_check_moodle.start()
     if not scheduled_digest.is_running():
         scheduled_digest.start()
+    if not daily_maintenance.is_running():
+        daily_maintenance.start()
 
 
 @bot.event

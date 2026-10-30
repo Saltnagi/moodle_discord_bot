@@ -1,10 +1,23 @@
 import datetime
+import glob
+import logging
+import os
+import shutil
 import sqlite3
 from contextlib import contextmanager
-from typing import Optional
+from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
-from config import DB_FILE, DEFAULT_FILTER_WORDS, DEFAULT_NOTIFY_TIMES
+from config import (
+    BACKUP_KEEP,
+    DATA_DIR,
+    DB_FILE,
+    DEFAULT_FILTER_WORDS,
+    DEFAULT_NOTIFY_TIMES,
+    RETENTION_DAYS,
+)
+
+log = logging.getLogger(__name__)
 
 JST = ZoneInfo("Asia/Tokyo")
 _TS = "%Y-%m-%dT%H:%M:%S"  # 日時を文字列で保存するときの形式（文字列比較で大小が分かる）
@@ -59,6 +72,34 @@ def _migrate_global_filters(conn):
         SELECT u.user_id, f.word FROM users u CROSS JOIN filters f
     """)
     conn.execute("DROP TABLE filters")
+
+
+# --- スキーマバージョン管理・マイグレーション ---
+def _migration_v1(conn: sqlite3.Connection):
+    """初期スキーマのインデックス作成などの調整（ベースライン）"""
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_notified_user_start ON notified(user_id, start);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_reminded_user_due ON reminded(user_id, due);")
+
+
+MIGRATIONS: list[tuple[int, Callable[[sqlite3.Connection], None]]] = [
+    (1, _migration_v1),
+]
+
+
+def run_migrations(conn: sqlite3.Connection):
+    """metaテーブルの schema_version を確認し、未適用のマイグレーションを順次実行する"""
+    row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+    current_version = int(row[0]) if row else 0
+
+    for version, migration_fn in MIGRATIONS:
+        if version > current_version:
+            log.info("DBマイグレーション適用中: v%d -> v%d", current_version, version)
+            migration_fn(conn)
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
+                (str(version),),
+            )
+            current_version = version
 
 
 def init_db() -> dict:
@@ -167,19 +208,12 @@ def init_db() -> dict:
         conn.execute("PRAGMA journal_mode = WAL;")
 
         _migrate_global_filters(conn)
+        run_migrations(conn)
 
         # すでに登録済みのユーザーは、これまでBotとやり取りしているのでガイドは表示済みとする
         conn.execute(
             "INSERT OR IGNORE INTO guide_shown (user_id) SELECT user_id FROM users"
         )
-
-        # 古い履歴の掃除
-        now = datetime.datetime.now(JST)
-        cutoff = (now - datetime.timedelta(days=30)).strftime("%Y-%m-%dT%H:%M")
-        conn.execute("DELETE FROM notified WHERE start < ?", (cutoff,))
-        conn.execute("DELETE FROM reminded WHERE due < ?", (cutoff,))
-        slot_cutoff = (now - datetime.timedelta(days=3)).strftime("%Y-%m-%d 00:00")
-        conn.execute("DELETE FROM digest_sent WHERE slot < ?", (slot_cutoff,))
 
         rows = conn.execute("SELECT user_id, ics_url FROM users").fetchall()
 
@@ -497,4 +531,66 @@ def save_user_health(
 def delete_user_health(user_id: int) -> None:
     with _connect() as conn:
         conn.execute("DELETE FROM user_health WHERE user_id = ?", (user_id,))
+
+
+# --- クリーンアップ・バックアップ ---
+def cleanup_old_records(now: Optional[datetime.datetime] = None, retention_days: int = RETENTION_DAYS) -> None:
+    """
+    - notified: start が retention_days 日以上前のレコードを削除
+    - reminded: due が retention_days 日以上前のレコードを削除
+    - digest_sent: slot（日付部分）が retention_days 日以上前のレコードを削除
+    - courses: fetched_at が 365日以上前のレコードを削除
+    """
+    if now is None:
+        now = datetime.datetime.now(JST)
+
+    cutoff = (now - datetime.timedelta(days=retention_days)).strftime("%Y-%m-%dT%H:%M")
+    slot_cutoff = (now - datetime.timedelta(days=retention_days)).strftime("%Y-%m-%d 00:00")
+    course_cutoff = (now - datetime.timedelta(days=365)).strftime(_TS)
+
+    with _connect() as conn:
+        conn.execute("DELETE FROM notified WHERE start < ?", (cutoff,))
+        conn.execute("DELETE FROM reminded WHERE due < ?", (cutoff,))
+        conn.execute("DELETE FROM digest_sent WHERE slot < ?", (slot_cutoff,))
+        conn.execute("DELETE FROM courses WHERE fetched_at < ?", (course_cutoff,))
+
+
+def backup_db(keep: int = BACKUP_KEEP) -> Optional[str]:
+    """
+    - backups/ ディレクトリを DATA_DIR 配下に作成
+    - sqlite3 の backup API を使用（稼働中のロック競合を回避）
+    - ファイル名: backups/moodle_bot_YYYYMMDD_HHMMSS.db
+    - 成功後、古いバックアップを keep 世代残して削除
+    """
+    backup_dir = os.path.join(DATA_DIR, "backups")
+    os.makedirs(backup_dir, exist_ok=True)
+
+    timestamp = datetime.datetime.now(JST).strftime("%Y%m%d_%H%M%S")
+    dest_path = os.path.join(backup_dir, f"moodle_bot_{timestamp}.db")
+
+    try:
+        src = get_connection()
+        dst = sqlite3.connect(dest_path)
+        with dst:
+            src.backup(dst)
+        dst.close()
+        src.close()
+        log.info("DBバックアップを作成しました: %s", dest_path)
+    except Exception as e:
+        log.error("DBバックアップの作成に失敗しました: %s", e)
+        return None
+
+    # 古いバックアップのローテーション
+    pattern = os.path.join(backup_dir, "moodle_bot_*.db")
+    backups = sorted(glob.glob(pattern))
+    if len(backups) > keep:
+        for old_file in backups[:-keep]:
+            try:
+                os.remove(old_file)
+                log.info("古いDBバックアップを削除しました: %s", old_file)
+            except OSError as e:
+                log.warning("古いDBバックアップの削除に失敗 (%s): %s", old_file, e)
+
+    return dest_path
+
 
