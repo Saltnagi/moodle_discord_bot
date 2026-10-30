@@ -756,13 +756,8 @@ async def check_user(user_id: int, target_url: str, now: datetime.datetime):
 
     # 1. Moodleから取得
     prefs = load_prefs(user_id)
-    try:
-        result = await fetch_for_user(target_url, prefs, now)
-    except moodle.MoodleError as e:
-        # 【重要】自動チェックでは、エラーが起きてもユーザーにDMは送らず、
-        # ターミナル（ログ）にだけ出力する。Moodleの深夜メンテナンスなどで
-        # エラー通知が何通も届くのを防ぐため。復旧後は通常どおり通知される。
-        log.warning("ユーザー %s の取得に失敗: %s", user_id, e)
+    result = await fetch_for_user_with_health(user_id, target_url, prefs, now)
+    if result is None:
         return
 
     # 2. 提出期限が近い予定（未リマインドのもの）があれば、この回はそれだけ通知する
